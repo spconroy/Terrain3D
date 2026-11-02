@@ -270,8 +270,15 @@
 		<method name="get_region_map" qualifiers="const">
 			<return type="PackedInt32Array" />
 			<description>
-				Returns a fully populated 32 x 32 array. The array location contains the region id + 1, or 0, which means no region.
+				Returns a fully populated 32 x 32 array. The array location contains the region id + 1, or 0, which means no region. The region id is the layer of the region in the texture arrays. It does not change while the region is active, and it is not the index in [method get_region_locations].
 				See [method get_region_map_index].
+			</description>
+		</method>
+		<method name="reserve_region_slots">
+			<return type="void" />
+			<param index="0" name="count" type="int" />
+			<description>
+				Sets the minimum number of layers allocated in the region texture arrays. Regions occupy a layer until they are removed, and adding or removing a region only writes its own layer. The arrays are recreated only when every layer is in use and a region is added, in steps of 8 layers or up to this count. Reserve the number of regions you expect to have loaded at once to avoid that. Each layer costs about 13.6 MB for a region size of 1024.
 			</description>
 		</method>
 		<method name="get_region_map_index" qualifiers="static">

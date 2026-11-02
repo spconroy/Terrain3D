@@ -723,11 +723,12 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 		}
 	}
 
-	TypedArray<Vector2i> region_locations = data->get_region_locations();
+	// Indexed by slot (region id - 1), which is also the layer in the region texture arrays
+	PackedVector2Array slot_locations = data->get_region_slot_locations();
 	PackedVector2Array padded_locations;
 	padded_locations.resize(_max_regions);
-	for (int i = 0; i < MIN(region_locations.size(), _max_regions); ++i) {
-		padded_locations[i] = region_locations[i];
+	for (int i = 0; i < MIN(slot_locations.size(), _max_regions); ++i) {
+		padded_locations[i] = slot_locations[i];
 	}
 	RS->material_set_param(p_material, "_region_locations", padded_locations);
 

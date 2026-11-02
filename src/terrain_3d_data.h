@@ -73,6 +73,17 @@ private:
 	PackedInt32Array _region_map;
 	bool _region_map_dirty = true;
 
+	// Region slots. A slot is a layer of the generated texture arrays, and is region_id - 1. An active region keeps
+	// its slot until it is removed, so adding or removing a region only writes its own layer instead of rebuilding
+	// every array. Freed slots are reused. The arrays grow in steps of REGION_SLOT_GROWTH layers.
+	// The Image arrays above are indexed by slot, with null in free slots.
+	// _region_locations stays a dense list of the active regions and its order is not the slot order.
+	static inline const int REGION_SLOT_GROWTH = 8;
+	PackedVector2Array _slot_locations; // slot -> region location, valid where _slot_owners is not 0
+	int _reserved_slots = 0; // Minimum layers to allocate, see reserve_region_slots()
+	PackedInt64Array _slot_owners; // slot -> instance id of the region occupying it, 0 if free
+	bool _layer_mipmaps[TYPE_MAX] = { false, false, false }; // Mipmap state the layered textures were created with
+
 	// These contain the TextureArray RIDs from the RenderingServer
 	GeneratedTexture _generated_height_maps;
 	GeneratedTexture _generated_control_maps;
@@ -80,6 +91,8 @@ private:
 
 	// Functions
 	void _clear();
+	bool _sync_regions();
+	bool _sync_map_array(const MapType p_type, GeneratedTexture &p_gen, TypedArray<Image> &p_maps, const PackedInt32Array &p_upload, const PackedInt32Array &p_freed, const bool p_resized);
 	void _copy_paste_dfr(const Terrain3DRegion *p_src_region, const Rect2i &p_src_rect, const Rect2i &p_dst_rect, const Terrain3DRegion *p_dst_region);
 	Error _save_export_image(const MapType p_map_type, const Ref<Image> &p_img, const String &p_path, const String &p_ext) const;
 
@@ -96,6 +109,9 @@ public:
 	TypedArray<Terrain3DRegion> get_regions_active(const bool p_copy = false, const bool p_deep = false) const;
 	Dictionary get_regions_all() const { return _regions; }
 	PackedInt32Array get_region_map() const { return _region_map; }
+	PackedVector2Array get_region_slot_locations() const { return _slot_locations; }
+	int get_region_slot_count() const { return _slot_owners.size(); }
+	void reserve_region_slots(const int p_count);
 	static int get_region_map_index(const Vector2i &p_region_loc);
 
 	void do_for_regions(const Rect2i &p_area, const Callable &p_callback);
@@ -239,7 +255,7 @@ inline int Terrain3DData::get_region_id(const Vector2i &p_region_loc) const {
 	int map_index = get_region_map_index(p_region_loc);
 	if (map_index >= 0) {
 		int region_id = _region_map[map_index] - 1; // 0 = no region
-		if (region_id >= 0 && region_id < _region_locations.size()) {
+		if (region_id >= 0 && region_id < _slot_owners.size()) {
 			return region_id;
 		}
 	}
