@@ -93,6 +93,10 @@ void Terrain3DEditor::_operate_map(const Vector3 &p_global_position, const real_
 		LOG(ERROR, "Invalid tool selected");
 		return;
 	}
+	if (map_type == TYPE_COLOR && !_terrain->get_color_map_enabled()) {
+		LOG(INFO, "Color map is disabled. Enable Terrain3D.color_map_enabled to paint color or roughness");
+		return;
+	}
 
 	int region_size = _terrain->get_region_size();
 	Vector2i region_vsize = V2I(region_size);
