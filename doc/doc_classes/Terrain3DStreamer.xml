@@ -4,6 +4,9 @@
 	</brief_description>
 	<description>
 		This class manages runtime region streaming. Regions around the clipmap target are loaded on background threads and evicted as the target moves away, so memory scales with the loaded area instead of the whole terrain. It works with the slot pool in [Terrain3DData]; see [method Terrain3DData.enable_streaming].
+		The loaded area is a keep set: the union of the clipmap target's own area ([member distance], scaled by [member camera_scale]) and any shapes added with [method add_keep_circle], [method add_keep_path] and [method add_keep_cone]. Regions inside the keep set load, regions outside it evict, with one region of hysteresis around the shapes. With no shapes the keep set is the clipmap target's area alone, as before. Shapes are in world units on the XZ plane. A region is inside a circle or a path corridor when any part of its footprint is within the radius; a cone is a half ellipse ahead of its origin and a smaller one behind it, grown by half a region, so it keeps every region it overlaps.
+		Load order: destination shapes first, then paths in order of arrival (the part of the path ahead of the clipmap target, nearest first), then everything else nearest first. Only regions inside the region map window ([member Terrain3D.region_map_size]) can take a slot, and the window stays centred on the clipmap target. A shape beyond the window loads its region bodies into a RAM cache ([member keep_cache_limit]) and they insert as soon as the window reaches them. If the pool has fewer slots than the keep set needs, the regions nearest the clipmap target are kept and the rest are counted as [code skip-lint]deferred[/code] in [method get_stats].
+		When a shape shrinks (a smaller radius, length or width, a shorter path) or is removed, or [member camera_scale] decreases, the next step evicts every region outside the new keep set at once, saving edited regions through the same worker thread as any eviction if [member persist_edits] is on (the early eviction is not limited by [member frame_budget_ms]), and drops loads still in flight for them. That keep set becomes the hysteresis baseline. Callers that want a gradual release lower the size a little each frame. Moving or growing a shape evicts nothing early.
 		Settings are exposed as aliases on the [Terrain3D] node (e.g. [member Terrain3D.streaming_enabled]), which is also where they are saved. Streaming only runs outside the editor; the editor always keeps the full terrain loaded.
 	</description>
 	<tutorials>
@@ -15,10 +18,51 @@
 				Consumes and drops every in flight threaded load. An unconsumed threaded load stays pinned in the ResourceLoader forever, so this runs whenever streaming stops: rescans, disabling streaming at runtime, and leaving the tree.
 			</description>
 		</method>
+		<method name="add_keep_circle">
+			<return type="int" />
+			<param index="0" name="center" type="Vector3" />
+			<param index="1" name="radius" type="float" />
+			<param index="2" name="destination" type="bool" default="false" />
+			<description>
+				Keeps every region within [param radius] world units of [param center] loaded, ignoring the height. Returns an id for [method set_keep_circle] and [method remove_keep]. A [param destination] shape loads before every other shape, e.g. the landing area of a long camera jump.
+			</description>
+		</method>
+		<method name="add_keep_cone">
+			<return type="int" />
+			<param index="0" name="origin" type="Vector3" />
+			<param index="1" name="direction" type="Vector3" />
+			<param index="2" name="length" type="float" />
+			<param index="3" name="half_width" type="float" />
+			<param index="4" name="behind" type="float" default="0.0" />
+			<param index="5" name="destination" type="bool" default="false" />
+			<description>
+				Keeps a forward biased area loaded: a half ellipse reaching [param length] world units from [param origin] along [param direction] (its Y component is ignored) and [param half_width] to each side, plus a smaller half ellipse of depth [param behind] on the other side. The region around [param origin] is always kept. Use it for a camera that looks where it travels, with [member camera_scale] set to 0. Returns an id for [method set_keep_cone] and [method remove_keep].
+			</description>
+		</method>
+		<method name="add_keep_path">
+			<return type="int" />
+			<param index="0" name="points" type="PackedVector3Array" />
+			<param index="1" name="radius" type="float" />
+			<description>
+				Keeps a corridor of [param radius] world units around the polyline through [param points] (at least two) loaded. Path regions load in order of arrival: nearest along the path first, starting from the point of the path closest to the clipmap target, regions behind that point last. Returns an id for [method set_keep_path] and [method remove_keep].
+			</description>
+		</method>
+		<method name="clear_keep">
+			<return type="void" />
+			<description>
+				Removes every keep shape and resets [member camera_scale] to 1, restoring the default loaded area. Regions outside it evict at the next step.
+			</description>
+		</method>
 		<method name="clear_virtual_locations">
 			<return type="void" />
 			<description>
 				Forgets every location added with [method register_virtual_locations] and rescans the data directory.
+			</description>
+		</method>
+		<method name="get_keep_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				The number of keep shapes added with the [code skip-lint]add_keep_*[/code] methods. The clipmap target's own area is not counted.
 			</description>
 		</method>
 		<method name="get_max_distance" qualifiers="const">
@@ -37,7 +81,7 @@
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns live streaming counters: [code skip-lint]streaming_active[/code], [code skip-lint]resident[/code], [code skip-lint]free_slots[/code], [code skip-lint]inflight[/code], [code skip-lint]staged[/code] (regions partway through a budgeted insertion), [code skip-lint]saving[/code] (evicted regions being written to disk), [code skip-lint]failed[/code] (locations whose load failed; each is requested again every few seconds, then ignored after three failures until [method scan_directory]), [code skip-lint]known[/code], [code skip-lint]landed_total[/code], [code skip-lint]evicted_total[/code], and [code skip-lint]land_ms_avg[/code] (an exponential moving average of an insertion's main thread cost in ms). Useful for debug overlays and tests.
+				Returns live streaming counters: [code skip-lint]streaming_active[/code], [code skip-lint]resident[/code], [code skip-lint]free_slots[/code], [code skip-lint]inflight[/code], [code skip-lint]staged[/code] (regions partway through a budgeted insertion), [code skip-lint]saving[/code] (evicted regions being written to disk), [code skip-lint]failed[/code] (locations whose load failed; each is requested again every few seconds, then ignored after three failures until [method scan_directory]), [code skip-lint]known[/code], [code skip-lint]landed_total[/code], [code skip-lint]evicted_total[/code], and [code skip-lint]land_ms_avg[/code] (an exponential moving average of an insertion's main thread cost in ms), and for the keep set [code skip-lint]keep_shapes[/code], [code skip-lint]wanted[/code] (known regions inside it), [code skip-lint]missing[/code] (wanted, inside the region map window, not resident yet), [code skip-lint]deferred[/code] (wanted but the slot pool cannot hold them) and [code skip-lint]outside_window[/code] (wanted but beyond the region map window, waiting in the RAM cache). Useful for debug overlays and tests.
 			</description>
 		</method>
 		<method name="is_active" qualifiers="const">
@@ -53,10 +97,47 @@
 				Makes locations known to the streamer that have no file in the data directory, so a [member resolver] can supply them. They stream like any other location. A virtual location the resolver does not answer for is looked up as the normal file name, fails to load and is marked failed. Registered locations survive [method scan_directory].
 			</description>
 		</method>
+		<method name="remove_keep">
+			<return type="void" />
+			<param index="0" name="id" type="int" />
+			<description>
+				Removes a keep shape. Regions only it kept evict at the next step, without hysteresis. Unknown ids are ignored.
+			</description>
+		</method>
 		<method name="scan_directory">
 			<return type="void" />
 			<description>
 				Scans the data directory for region locations and resets streaming state. Only file names are read, nothing is loaded. Called automatically at initialization while streaming is active.
+			</description>
+		</method>
+		<method name="set_keep_circle">
+			<return type="bool" />
+			<param index="0" name="id" type="int" />
+			<param index="1" name="center" type="Vector3" />
+			<param index="2" name="radius" type="float" />
+			<description>
+				Moves or resizes a circle in place. Returns [code skip-lint]false[/code] if [param id] is not a circle. A smaller radius evicts early; see the class description.
+			</description>
+		</method>
+		<method name="set_keep_cone">
+			<return type="bool" />
+			<param index="0" name="id" type="int" />
+			<param index="1" name="origin" type="Vector3" />
+			<param index="2" name="direction" type="Vector3" />
+			<param index="3" name="length" type="float" />
+			<param index="4" name="half_width" type="float" />
+			<param index="5" name="behind" type="float" default="0.0" />
+			<description>
+				Moves, turns or resizes a cone in place, e.g. every frame with the camera. Returns [code skip-lint]false[/code] if [param id] is not a cone. A zero [param direction] keeps the old one. A smaller length, half width or behind evicts early; see the class description.
+			</description>
+		</method>
+		<method name="set_keep_path">
+			<return type="bool" />
+			<param index="0" name="id" type="int" />
+			<param index="1" name="points" type="PackedVector3Array" />
+			<param index="2" name="radius" type="float" />
+			<description>
+				Replaces a path's points and radius in place, e.g. to drop the part behind the camera. Returns [code skip-lint]false[/code] if [param id] is not a path. A smaller radius or fewer points evicts early; see the class description.
 			</description>
 		</method>
 		<method name="step">
@@ -67,6 +148,9 @@
 		</method>
 	</methods>
 	<members>
+		<member name="camera_scale" type="float" setter="set_camera_scale" getter="get_camera_scale" default="1.0">
+			Scales the clipmap target's own loaded area: [member distance] x camera_scale regions. 1 is the normal area, 0 removes it so that only keep shapes load. Lowering it evicts the area it gave up at once, with no hysteresis band. To shrink gradually, lower it a little every frame. [method clear_keep] resets it to 1.
+		</member>
 		<member name="concurrent_loads" type="int" setter="set_concurrent_loads" getter="get_concurrent_loads" default="3">
 			How many regions may be loading on background threads at once. Loading runs wide while insertions stay narrow; see [member loads_per_frame].
 		</member>
@@ -82,6 +166,9 @@
 			A region becomes visible only after all of its steps are done. The same budget spreads building the region's [Terrain3DInstancer] instances over frames, one mesh asset at a time.
 			Lower values keep frame times steadier but fill the loaded area more slowly. Raise it, or set it to 0 (each region is then inserted at once, up to [member loads_per_frame] per frame), while a loading screen hides the hitch, for example after a teleport.
 			Alias target of [member Terrain3D.streaming_frame_budget_ms].
+		</member>
+		<member name="keep_cache_limit" type="int" setter="set_keep_cache_limit" getter="get_keep_cache_limit" default="128">
+			The most region bodies kept in the RAM cache for keep shapes beyond the region map window while [member mode] is DISK. Each cached region costs its full raw size (about 3 MB at 512 m with all maps). RAM mode caches everything anyway.
 		</member>
 		<member name="mode" type="int" setter="set_mode" getter="get_mode" enum="Terrain3DStreamer.StreamMode" default="0">
 			What eviction does with a region's data. DISK drops the region; RAM keeps every body cached in memory (and prefetches the rest of the world in the background with spare load budget), so only the GPU layers follow the loaded area and revisits never touch the disk. RAM mode trades memory for the smoothest possible region changes. In either mode a region's edits are written back only when [member persist_edits] is on.
