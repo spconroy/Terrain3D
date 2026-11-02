@@ -393,6 +393,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	var prev_front := -1.0
 	var sat_prev_loads: int = s.get_stats().disk_loads_needed
 	var mid_speeds: Array[float] = []
+	var all_speeds: Array[float] = []
 	var mid_dvdt: Array[float] = []
 	var m := {"quality_min": 1.0, "adapt_a": 0.0, "adapt_j": 0.0, "adapt_frames": 0, "ticks": 0, "holes": 0, "holes_near": 0, "behind_age_max": 0, "arrive": -1.0, "complete": -1.0, "peak_v": 0.0,
 			"min_ready": INF, "resident_max": 0, "da_ratio": 0.0, "dv_max": 0.0, "dv_frames": 0, "peak_a": 0.0, "peak_j": 0.0,
@@ -478,8 +479,10 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			m.adapt_a = maxf(m.adapt_a, absf(g.accel))
 			m.adapt_j = maxf(m.adapt_j, absf(g.jerk))
 		if g.distance > 0.15 * length and g.distance < 0.85 * length:
-			mid_speeds.append(g.speed)
-			mid_dvdt.append((g.speed - prev_v) / dt)
+			all_speeds.append(g.speed)
+			if not activated:
+				mid_speeds.append(g.speed)
+				mid_dvdt.append((g.speed - prev_v) / dt)
 		m.dv_max = maxf(m.dv_max, absf(g.speed - prev_v))
 		m.dv_frames += 1 if absf(g.speed - prev_v) > 0.03 * g.max_speed else 0
 		prev_v = g.speed
@@ -622,7 +625,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 					m.ring_early += 1
 					break
 		# Landing
-		var ring_ready := true
+		var ring_ready: bool = st.missing == 0 # Everything wanted, and below the whole ring
 		for loc in ring_all:
 			if not _t.data.has_region(loc):
 				ring_ready = false
@@ -695,10 +698,14 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			wob += (d - mean) * (d - mean)
 		wob = sqrt(wob / mid_dvdt.size())
 	m["min_frac"] = vmin / maxf(cruise, 1.0)
+	var vmin_all := INF
+	for v in all_speeds:
+		vmin_all = minf(vmin_all, v)
+	m["min_frac_all"] = vmin_all / maxf(cruise, 1.0) if not all_speeds.is_empty() else 0.0
 	var theory := length / g.max_speed + 1.5
 	var actual_rate := front_adv / sat_time if sat_time > 0.3 else -1.0
-	row += " | v2: cap %.0f cruise %.0f min speed %.2f of cruise, wobble %.0f, adapt a %.0f j %.0f (%d frames), quality min %.2f, lost %.1f s vs cap flight, rate est (mean before the destination) %.0f / actual front advance %.0f m/s" % [
-			g.max_speed, cruise, m.min_frac, wob, m.adapt_a, m.adapt_j, m.adapt_frames, m.quality_min, m.arrive - theory, est_sum / maxf(float(est_n), 1.0) if est_n > 0 else -1.0, actual_rate]
+	row += " | v2: cap %.0f cruise %.0f min speed %.2f of cruise (%.2f including the destination phase), wobble %.0f, adapt a %.0f j %.0f (%d frames), quality min %.2f, lost %.1f s vs cap flight, rate est (mean before the destination) %.0f / actual front advance %.0f m/s" % [
+			g.max_speed, cruise, m.min_frac, m.min_frac_all, wob, m.adapt_a, m.adapt_j, m.adapt_frames, m.quality_min, m.arrive - theory, est_sum / maxf(float(est_n), 1.0) if est_n > 0 else -1.0, actual_rate]
 	if m.has("classes_missing"):
 		row += " | missing at arrival: " + str(m.classes_missing)
 	if cfg.collision != "off":

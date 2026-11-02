@@ -53,7 +53,8 @@ var brake_tau := 0.15
 ## with a fraction of the normal deceleration and jerk, after the sharp footprint was degraded (quality) before slowing.
 ## The braking distance clamp stays underneath as the hole free failsafe. Turn off for the v1 behaviour.
 var soft := true
-var soft_k := 0.4 ## 1/s: speed change per meter of ready distance above or below the desired margin
+var soft_k := 0.3 ## 1/s: speed change per meter of ready distance above or below the desired margin
+var ready_soft_tau := 1.2 ## s, time constant of the slower ready distance the soft law uses
 var soft_decel_fraction := 0.35 ## of max_accel while adapting
 var soft_jerk_fraction := 0.3 ## of max_jerk while adapting
 var cruise_fraction := 0.88 ## cruise speed as a share of the measured sustainable rate
@@ -61,6 +62,7 @@ var floor_fraction := 0.3 ## the soft law never asks for less than this share of
 var margin_look := 0.25 ## s of travel kept as a buffer on top of safety and the stopping distance
 var rate_tau := 2.0 ## s, time constant of a rise of the sustainable rate estimate (low bandwidth)
 var rate_tau_down := 0.7 ## s, time constant of a fall (a loader that slows is believed sooner than one that speeds up)
+var rate_hold_tau := 1.5 ## s, the soft law follows the rate estimate through this extra low pass
 var rate_window := 0.5 ## s, length of one throughput sample
 var stretch_until := 1.75 ## s: while no estimate exists yet, accelerate with stretch_accel x max_accel until here
 var stretch_accel := 0.6
@@ -99,11 +101,13 @@ var climb_accel := 0.0
 var pitch := 0.0 ## Radians, negative is nose down
 var fov := 75.0
 var ready_filtered := INF
+var ready_soft := INF ## Slower copy of ready_filtered for the soft law (steps of a landed column do not move the target)
 var clamp_hits := 0 ## Steps where the hard clamp had to hold the camera back (should stay 0)
 var min_ready_margin := INF ## Smallest (ready distance - travel - safety) over the steps that were limited by loading
 var plan_clearance := INF ## Smallest planned altitude above the terrain samples, from setup()
 var rate_est := 0.0 ## Sustainable path rate estimate (m/s), valid once rate_valid
 var rate_valid := false
+var rate_hold := 0.0 ## rate_est smoothed further for the soft law
 var rate_samples := 0
 var elapsed := 0.0
 var adapting := false ## The soft law is limiting the speed this step
@@ -210,6 +214,7 @@ func setup(path_length: float, heights: PackedFloat32Array, sample_step: float, 
 	if auto_cap:
 		max_speed = cap_for_distance(path_length)
 	rate_est = 0.0
+	rate_hold = 0.0
 	rate_valid = false
 	rate_samples = 0
 	elapsed = 0.0
@@ -228,6 +233,7 @@ func setup(path_length: float, heights: PackedFloat32Array, sample_step: float, 
 	clamp_hits = 0
 	min_ready_margin = INF
 	ready_filtered = INF
+	ready_soft = INF
 	var top := ground_start
 	for h in heights:
 		top = maxf(top, h)
@@ -314,12 +320,12 @@ func soft_target() -> float:
 	# is loaded, so the flight is one smooth profile and does not speed up at the end
 	var hold := INF
 	if rate_valid and _limit_seen:
-		hold = clampf(cruise_fraction * rate_est, floor_fraction * max_speed, max_speed)
-	if is_inf(ready_filtered):
+		hold = clampf(cruise_fraction * rate_hold, floor_fraction * max_speed, max_speed)
+	if is_inf(ready_soft):
 		return hold
 	var margin := safety + stop_distance(speed, max_accel * brake_fraction, max_jerk) + speed * margin_look
-	var rate_ref := rate_est * 0.95 if rate_valid else speed
-	var v := rate_ref + soft_k * (ready_filtered - margin)
+	var rate_ref := rate_hold * 0.95 if rate_valid else speed
+	var v := rate_ref + soft_k * (ready_soft - margin)
 	return minf(clampf(v, floor_fraction * max_speed, max_speed), hold)
 
 
@@ -336,6 +342,7 @@ func step(delta: float, ready_distance: float = INF) -> void:
 	var limited := not is_inf(ready_distance) and ready_distance < remaining - 1.0
 	if not limited:
 		ready_filtered = INF
+		ready_soft = INF
 	elif is_inf(ready_filtered):
 		ready_filtered = ready_distance
 	else:
@@ -344,23 +351,33 @@ func step(delta: float, ready_distance: float = INF) -> void:
 			ready_filtered = ready_distance
 		else:
 			ready_filtered = predicted + (ready_distance - predicted) * (1.0 - exp(-dt / ready_tau))
+	if not is_inf(ready_filtered):
+		ready_soft = ready_filtered if is_inf(ready_soft) else lerpf(ready_soft - speed * dt, ready_filtered, 1.0 - exp(-dt / ready_soft_tau))
 	var a_prev := accel
 	var v_hard := target_speed()
 	var v_soft := soft_target()
 	soft_speed = v_soft
 	var v_target := minf(v_hard, v_soft)
 	adapting = soft and v_soft < v_hard and v_soft < max_speed * 0.995
-	_limit_seen = _limit_seen or (adapting and rate_valid)
+	var ready_brake := INF if is_inf(ready_filtered) else speed_for_distance(ready_filtered - safety, max_accel * brake_fraction, max_jerk)
+	var loader_limited := soft and rate_valid and minf(v_soft, ready_brake) < max_speed * 0.97
+	_limit_seen = _limit_seen or loader_limited
+	if rate_valid:
+		rate_hold = rate_est if rate_hold <= 0.0 else lerpf(rate_hold, rate_est, 1.0 - exp(-dt / rate_hold_tau))
 	if soft and rate_valid and limited and _unsat_time >= 0.5:
 		# The queue is not full although regions are missing: the loader is not the limit, probe upwards slowly
 		rate_est = minf(rate_est * (1.0 + 0.25 * dt), max_speed / cruise_fraction)
 	if soft:
-		if adapting and rate_valid:
+		if loader_limited:
 			quality = maxf(quality - quality_rate * dt, quality_min) # Shrink the sharp footprint before slowing further
 	if adapting:
 		# Smooth loader limited speed: a fraction of the normal deceleration and jerk, no braking curve
-		var a_lim := max_accel * soft_decel_fraction if v_target < speed else max_accel
-		accel = track(speed, accel, v_target, a_lim, max_jerk * soft_jerk_fraction, dt)
+		# Once the loader has limited the flight both directions change gently; before that the take-off accelerates
+		# normally. Where the gentle jerk could not stop the speed at the target in time, the full jerk is used.
+		var a_lim := max_accel * soft_decel_fraction if (v_target < speed or _limit_seen) else max_accel
+		var j_soft := max_jerk * soft_jerk_fraction
+		var j_use := j_soft if (accel <= 0.0 or speed + accel * accel / (2.0 * j_soft) <= v_target * 1.02) else max_jerk
+		accel = track(speed, accel, v_target, a_lim, j_use, dt)
 	elif v_target < max_speed - 1.0:
 		# A braking constraint is active. Its target falls along the stopping curve as the camera
 		# approaches, so follow it with its rate of change fed forward (a plain error law would trail it
@@ -371,7 +388,7 @@ func step(delta: float, ready_distance: float = INF) -> void:
 	else:
 		var a_up := max_accel * stretch_accel if (soft and _observed and not rate_valid and elapsed < stretch_until and speed < 0.7 * max_speed) else max_accel
 		accel = track(speed, accel, v_target, a_up, max_jerk, dt)
-	var v_new := maxf(speed + accel * dt, 0.0)
+	var v_new := clampf(speed + accel * dt, 0.0, max_speed)
 	var ds := (speed + v_new) * 0.5 * dt
 	# Failsafe: never move into the last `safety` meters in front of the camera's loaded terrain
 	if limited:
