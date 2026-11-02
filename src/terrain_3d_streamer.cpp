@@ -221,6 +221,8 @@ void Terrain3DStreamer::scan_directory() {
 	LOG(INFO, "Streaming scan: ", _known.size(), " regions on disk at ", dir);
 }
 
+static real_t _rect_point_dist2(const Vector2 &p_min, const Vector2 &p_max, const Vector2 &p_point);
+
 // Runs the streaming state machine once per physics frame: evict regions that fell
 // outside the keep set, insert completed loads, and request missing regions.
 // The keep set is the union of the clipmap target's own area (distance regions, scaled by
@@ -624,6 +626,16 @@ void Terrain3DStreamer::step() {
 			_mark_failed(ready[i].loc, true);
 		}
 	}
+	// How far is the nearest wanted region that is not visible yet? Staged and cached regions are not.
+	_stat_nearest = -1.f;
+	for (const KeyValue<Vector2i, Want> &kv : wanted) {
+		if (kv.value.behind || data->has_region(kv.key)) {
+			continue;
+		}
+		const Vector2 rmin = Vector2(kv.key) * span;
+		const real_t d = Math::sqrt(_rect_point_dist2(rmin, rmin + V2(span), fpos));
+		_stat_nearest = _stat_nearest < 0.f ? d : MIN(_stat_nearest, d);
+	}
 	// Request missing regions within the keep set in load order. Every pending body
 	// inside the map window claims a slot on insertion, so never keep more of those in
 	// flight than free slots can absorb. Bodies for spots beyond the window only take IO.
@@ -734,6 +746,7 @@ Dictionary Terrain3DStreamer::get_stats() const {
 	d["missing"] = _stat_missing; // Wanted, inside the map window and not resident yet
 	d["deferred"] = _stat_deferred; // Wanted but the slot pool cannot hold them
 	d["outside_window"] = _stat_outside; // Wanted but beyond the region map window
+	d["nearest_missing"] = _stat_nearest; // Meters to the nearest wanted region not visible yet, not behind the target, -1 if none
 	return d;
 }
 
@@ -983,7 +996,108 @@ Terrain3DStreamer::KeepShape *Terrain3DStreamer::_find_keep(const int p_id, cons
 	return nullptr;
 }
 
-void Terrain3DStreamer::_set_path(KeepShape &p_shape, const PackedVector3Array &p_points) {
+// Every region a path corridor touches, with the arc positions where the path enters (x) and leaves
+// (y) the region grown by the corridor radius. A conservative box: the entry can be early at a corner.
+void Terrain3DStreamer::_path_regions(const KeepShape &p_shape, HashMap<Vector2i, Vector2> &r_arcs) const {
+	const real_t span = _region_span();
+	for (int i = 0; i + 1 < p_shape.points.size(); i++) {
+		const Vector2 a = p_shape.points[i];
+		const Vector2 b = p_shape.points[i + 1];
+		const real_t len = (b - a).length();
+		const Vector2 lo = a.min(b) - V2(p_shape.radius);
+		const Vector2 hi = a.max(b) + V2(p_shape.radius);
+		const Vector2i c0 = Vector2i((lo / span).floor());
+		const Vector2i c1 = Vector2i((hi / span).floor());
+		for (int y = c0.y; y <= c1.y; y++) {
+			for (int x = c0.x; x <= c1.x; x++) {
+				const Vector2i loc(x, y);
+				if (!_segment_hit(p_shape, i, loc, 0.f, nullptr)) {
+					continue;
+				}
+				const Vector2 rmin = Vector2(loc) * span - V2(p_shape.radius);
+				real_t t0 = 0.f;
+				real_t t1 = 1.f;
+				if (!_segment_clip(a, b, rmin, rmin + V2(span + 2.f * p_shape.radius), &t0, &t1)) {
+					continue;
+				}
+				const Vector2 range = Vector2(p_shape.arc[i] + t0 * len, p_shape.arc[i] + t1 * len);
+				Vector2 *known = r_arcs.getptr(loc);
+				if (known == nullptr) {
+					r_arcs[loc] = range;
+				} else {
+					known->x = MIN(known->x, range.x);
+					known->y = MAX(known->y, range.y);
+				}
+			}
+		}
+	}
+}
+
+// Meters along a path, from the clipmap target's position on it (or from p_from_distance), until
+// the first region it needs that is not visible yet, or to the end of the path when all are.
+// A region counts only once it is inserted: cached and staged regions are not visible.
+real_t Terrain3DStreamer::get_path_ready_distance(const int p_id, const real_t p_from_distance) const {
+	const KeepShape *shape = nullptr;
+	for (int i = 0; i < _keep.size(); i++) {
+		if (_keep[i].id == p_id && _keep[i].type == KeepShape::PATH) {
+			shape = &_keep[i];
+		}
+	}
+	Terrain3DData *data = _terrain != nullptr ? _terrain->get_data() : nullptr;
+	ERR_FAIL_COND_V_MSG(shape == nullptr, -1.f, "Unknown keep path id");
+	ERR_FAIL_NULL_V(data, -1.f);
+	const real_t total = shape->arc[shape->arc.size() - 1];
+	const real_t from = p_from_distance >= 0.f ? MIN(p_from_distance, total) : _arc_of(*shape, _xz(_terrain->get_clipmap_target_position()));
+	HashMap<Vector2i, Vector2> regions;
+	_path_regions(*shape, regions);
+	real_t ready = total - from;
+	for (const KeyValue<Vector2i, Vector2> &kv : regions) {
+		if (kv.value.y < from || !_known_set.has(kv.key) || data->has_region(kv.key)) {
+			continue; // Behind, no file, or visible
+		}
+		const uint64_t *until = _failed.getptr(kv.key);
+		if (until != nullptr && *until == UINT64_MAX) {
+			continue; // Given up on: it will never load
+		}
+		ready = MIN(ready, MAX(kv.value.x - from, 0.f));
+	}
+	return ready;
+}
+
+// What a corridor around a polyline costs to hold: the regions with a file that it touches, the raw
+// bytes of their bodies (what the RAM cache holds per region) and how many are beyond the region
+// map window now, so they can only be cached until the window reaches them.
+Dictionary Terrain3DStreamer::get_path_cost(const PackedVector3Array &p_points, const real_t p_radius) const {
+	Dictionary d;
+	ERR_FAIL_COND_V_MSG(p_points.size() < 2, d, "A path needs at least two points");
+	Terrain3DData *data = _terrain != nullptr ? _terrain->get_data() : nullptr;
+	KeepShape shape;
+	shape.type = KeepShape::PATH;
+	shape.radius = MAX(p_radius, 0.f);
+	_set_path(shape, p_points);
+	HashMap<Vector2i, Vector2> regions;
+	_path_regions(shape, regions);
+	int known = 0;
+	int outside = 0;
+	for (const KeyValue<Vector2i, Vector2> &kv : regions) {
+		if (_known_set.has(kv.key)) {
+			known++;
+			outside += (data != nullptr && data->get_region_map_index(kv.key) < 0) ? 1 : 0;
+		}
+	}
+	const int64_t size = _terrain != nullptr ? (int)_terrain->get_region_size() : 0;
+	const int64_t maps = (_terrain != nullptr && !_terrain->get_color_map_enabled()) ? 2 : 3;
+	const int64_t region_bytes = size * size * 4 * maps; // Height, control and color are 4 bytes a vertex
+	d["length"] = shape.arc[shape.arc.size() - 1];
+	d["cells"] = (int)regions.size();
+	d["regions"] = known;
+	d["region_bytes"] = region_bytes;
+	d["bytes"] = region_bytes * known;
+	d["outside_window"] = outside;
+	return d;
+}
+
+void Terrain3DStreamer::_set_path(KeepShape &p_shape, const PackedVector3Array &p_points) const {
 	p_shape.points.clear();
 	p_shape.arc.clear();
 	real_t arc = 0.f;
@@ -1395,6 +1509,8 @@ void Terrain3DStreamer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_keep_path", "id", "points", "radius"), &Terrain3DStreamer::set_keep_path);
 	ClassDB::bind_method(D_METHOD("set_keep_cone", "id", "origin", "direction", "length", "half_width", "behind"),
 			&Terrain3DStreamer::set_keep_cone, DEFVAL(0.f));
+	ClassDB::bind_method(D_METHOD("get_path_ready_distance", "id", "from_distance"), &Terrain3DStreamer::get_path_ready_distance, DEFVAL(-1.f));
+	ClassDB::bind_method(D_METHOD("get_path_cost", "points", "radius"), &Terrain3DStreamer::get_path_cost);
 	ClassDB::bind_method(D_METHOD("remove_keep", "id"), &Terrain3DStreamer::remove_keep);
 	ClassDB::bind_method(D_METHOD("clear_keep"), &Terrain3DStreamer::clear_keep);
 	ClassDB::bind_method(D_METHOD("get_keep_count"), &Terrain3DStreamer::get_keep_count);

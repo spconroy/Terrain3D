@@ -130,6 +130,7 @@ private:
 	int _stat_missing = 0;
 	int _stat_deferred = 0;
 	int _stat_outside = 0;
+	real_t _stat_nearest = -1.f;
 	uint64_t _landed_total = 0; // Counters for get_stats()
 	uint64_t _evicted_total = 0;
 	real_t _land_ms_avg = 0.f;
@@ -146,8 +147,9 @@ private:
 	void _update_axis();
 	bool _is_behind(const Vector2i &p_region_loc) const;
 	bool _cut_behind(const Vector2i &p_region_loc) const;
+	void _path_regions(const KeepShape &p_shape, HashMap<Vector2i, Vector2> &r_arcs) const;
 	KeepShape *_find_keep(const int p_id, const KeepShape::Type p_type);
-	void _set_path(KeepShape &p_shape, const PackedVector3Array &p_points);
+	void _set_path(KeepShape &p_shape, const PackedVector3Array &p_points) const;
 	void _collision_refresh(const Vector2i &p_region_loc);
 	void _collision_flush();
 	void _retire(const Vector2i &p_region_loc, const Ref<Terrain3DRegion> &p_region, const String &p_dir);
@@ -207,6 +209,8 @@ public:
 	bool set_keep_path(const int p_id, const PackedVector3Array &p_points, const real_t p_radius);
 	bool set_keep_cone(const int p_id, const Vector3 &p_origin, const Vector3 &p_direction, const real_t p_length,
 			const real_t p_half_width, const real_t p_behind = 0.f);
+	real_t get_path_ready_distance(const int p_id, const real_t p_from_distance = -1.f) const;
+	Dictionary get_path_cost(const PackedVector3Array &p_points, const real_t p_radius) const;
 	void remove_keep(const int p_id);
 	void clear_keep();
 	int get_keep_count() const { return _keep.size(); }
