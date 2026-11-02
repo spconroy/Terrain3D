@@ -422,7 +422,7 @@ func _test_eviction_and_baseline() -> void:
 	_clean(dir)
 
 
-# 5. A pool smaller than the union keeps the regions nearest the camera and reports the rest
+# 5. A pool smaller than the union keeps what is needed first (ahead of the travel direction, nearest first) and reports the rest
 func _test_pool_deferred() -> void:
 	var dir := _root_dir + "/pool"
 	_author_block(dir, 64, -12, 12, -6, 6)
@@ -441,17 +441,24 @@ func _test_pool_deferred() -> void:
 	ok(st.wanted == union.size(), "pool: wanted %d == %d" % [st.wanted, union.size()])
 	ok(st.deferred == union.size() - 25, "pool: deferred %d == union %d - 25 slots" % [st.deferred, union.size()])
 	ok(_t.data.get_region_count() == 25 and _t.data.get_free_slot_count() == 0, "pool: 25 resident, none free (%d)" % _t.data.get_region_count())
-	# Nearest to the camera first: every resident is at least as near as every deferred region
+	# Ahead of the path direction first, nearest first; the regions behind the camera (x < camera) go last
 	var cam_loc := Vector2i(-8, 0)
-	var far_res := 0.0
-	for loc: Vector2i in _resident():
-		far_res = maxf(far_res, float(maxi(absi(loc.x - cam_loc.x), absi(loc.y - cam_loc.y))))
-	var near_def := INF
 	var res := _resident()
+	var far_res := 0.0
+	var near_def := INF
+	var behind_res := 0
+	var ahead_def := 0
 	for loc: Vector2i in union:
-		if not res.has(loc):
-			near_def = minf(near_def, float(maxi(absi(loc.x - cam_loc.x), absi(loc.y - cam_loc.y))))
-	ok(far_res <= near_def, "pool: residents reach %.0f regions out, deferred start at %.0f" % [far_res, near_def])
+		var d := float(maxi(absi(loc.x - cam_loc.x), absi(loc.y - cam_loc.y)))
+		if loc.x < cam_loc.x:
+			behind_res += 1 if res.has(loc) else 0
+		elif res.has(loc):
+			far_res = maxf(far_res, d)
+		else:
+			near_def = minf(near_def, d)
+			ahead_def += 1
+	ok(far_res <= near_def, "pool: ahead residents reach %.0f regions out, deferred ahead start at %.0f" % [far_res, near_def])
+	ok(behind_res == 0 or ahead_def == 0, "pool: no region behind the camera is resident while one ahead is deferred (%d behind resident, %d ahead deferred)" % [behind_res, ahead_def])
 	ok(st.missing == 0, "pool: nothing admitted is still missing (%d)" % st.missing)
 	# Moving the camera forward trades the far end for the near end, no slot leak
 	_place(cam, Vector2i(4, 0))

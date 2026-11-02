@@ -52,6 +52,7 @@ private:
 		Vector2 dir = Vector2(0.f, -1.f); // Cone forward, unit length
 		Vector<Vector2> points; // Path polyline
 		Vector<real_t> arc; // Path: distance along the polyline at each point
+		real_t cam_arc = 0.f; // Path: arc position of the clipmap target, set every step
 		real_t radius = 0.f; // Circle radius, path corridor radius, cone half width
 		real_t length = 0.f; // Cone extent ahead
 		real_t behind = 0.f; // Cone extent behind
@@ -116,6 +117,9 @@ private:
 	Vector2 _last_focus;
 	Vector2i _focus_loc; // Region location of the clipmap target, set every step
 	bool _has_last_focus = false;
+	Vector2 _focus_pos; // Clipmap target on the XZ plane, set every step
+	Vector2 _axis; // Direction of travel of the keep set, unit length: the first path's tangent at the target, else the first cone's
+	bool _has_axis = false;
 	Vector<KeepShape> _keep; // Extra keep shapes, see add_keep_circle()
 	int _next_keep_id = 1;
 	HashSet<Vector2i> _discard; // In flight loads to drop when they land
@@ -137,7 +141,9 @@ private:
 	real_t _region_span() const;
 	bool _shape_hit(const KeepShape &p_shape, const Vector2i &p_region_loc, const real_t p_expand, real_t *r_rank) const;
 	bool _segment_hit(const KeepShape &p_shape, const int p_index, const Vector2i &p_region_loc, const real_t p_expand, real_t *r_arc) const;
-	real_t _arc_of(const KeepShape &p_shape, const Vector2 &p_point) const;
+	real_t _arc_of(const KeepShape &p_shape, const Vector2 &p_point, Vector2 *r_dir = nullptr) const;
+	void _update_axis();
+	bool _is_behind(const Vector2i &p_region_loc) const;
 	KeepShape *_find_keep(const int p_id, const KeepShape::Type p_type);
 	void _set_path(KeepShape &p_shape, const PackedVector3Array &p_points);
 	void _collision_refresh(const Vector2i &p_region_loc);

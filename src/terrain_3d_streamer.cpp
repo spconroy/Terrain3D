@@ -265,23 +265,32 @@ void Terrain3DStreamer::step() {
 	}
 	_last_focus = fpos;
 	_has_last_focus = true;
+	_focus_pos = fpos;
+	_update_axis();
 	const bool keep_active = _keep_active();
 	const real_t span = _region_span();
 	uint64_t start_us = Time::get_singleton()->get_ticks_usec();
 	_poll_retiring(false);
 
 	// Collect the wanted set: every known region inside the keep set, with its load order.
-	// Order is (tier, rank): destination shapes first, then paths in order of arrival from the
-	// target, then everything else nearest first with ties broken toward the travel direction.
+	// Order is (behind, tier, rank): regions behind the direction of travel last, then destination
+	// shapes first, then paths in order of arrival from the target, then everything else nearest
+	// first with ties broken toward the travel direction. defer is how far the region is from being
+	// needed, in meters: a short pool keeps the smallest values and defers the rest, behind last.
 	struct Want {
 		Vector2i loc;
 		int tier = 2;
 		real_t rank = 0.f;
 		real_t ahead = 0.f;
 		real_t cam_d = 0.f;
+		bool behind = false;
+		real_t defer = 0.f;
 	};
 	struct WantSort {
 		bool operator()(const Want &a, const Want &b) const {
+			if (a.behind != b.behind) {
+				return b.behind;
+			}
 			if (a.tier != b.tier) {
 				return a.tier < b.tier;
 			}
@@ -299,8 +308,20 @@ void Terrain3DStreamer::step() {
 			return a.ahead > b.ahead;
 		}
 	};
+	struct DeferSort {
+		bool operator()(const Want &a, const Want &b) const {
+			if (a.behind != b.behind) {
+				return b.behind;
+			}
+			if (!Math::is_equal_approx(a.defer, b.defer)) {
+				return a.defer < b.defer;
+			}
+			return a.ahead > b.ahead;
+		}
+	};
 	HashMap<Vector2i, Want> wanted;
-	auto add_want = [&](const Vector2i &p_loc, int p_tier, real_t p_rank, real_t p_ahead) {
+	// p_defer < 0 means the distance to the target in meters. A path passes its arrival distance.
+	auto add_want = [&](const Vector2i &p_loc, int p_tier, real_t p_rank, real_t p_ahead, bool p_behind, real_t p_defer = -1.f) {
 		if (!_known_set.has(p_loc) || _is_failed(p_loc)) {
 			return;
 		}
@@ -310,8 +331,17 @@ void Terrain3DStreamer::step() {
 		w.rank = p_rank;
 		w.ahead = p_ahead;
 		w.cam_d = _distance_to(p_loc, floc);
-		if (wanted.has(p_loc) && !WantSort()(w, wanted[p_loc])) {
-			return;
+		w.behind = p_behind;
+		w.defer = p_defer >= 0.f ? p_defer : w.cam_d * span;
+		Want *old = wanted.getptr(p_loc);
+		if (old != nullptr) {
+			// A region claimed twice keeps the better order and the nearer need
+			const real_t defer = MIN(old->defer, w.defer);
+			if (!WantSort()(w, *old)) {
+				old->defer = defer;
+				return;
+			}
+			w.defer = defer;
 		}
 		wanted[p_loc] = w;
 	};
@@ -325,7 +355,7 @@ void Terrain3DStreamer::step() {
 				}
 				real_t d = _distance_to(loc, floc);
 				real_t ahead = (d == 0.f) ? 1.f : _travel_dir.dot(Vector2(real_t(dx), real_t(dy)).normalized());
-				add_want(loc, 2, d, ahead);
+				add_want(loc, 2, d, ahead, _is_behind(loc));
 			}
 		}
 	}
@@ -343,9 +373,11 @@ void Terrain3DStreamer::step() {
 					for (int x = c0.x; x <= c1.x; x++) {
 						real_t arc = 0.f;
 						if (_segment_hit(s, i, Vector2i(x, y), 0.f, &arc)) {
-							// Ahead of the target first, in order along the path; behind last
-							real_t rank = arc >= cam_arc ? arc - cam_arc : 1e9f + (cam_arc - arc);
-							add_want(Vector2i(x, y), tier, rank, 0.f);
+							// Ahead of the target first, in order along the path; behind last. The region
+							// the target stands in is ahead whichever side of its center the target is
+							const bool behind = arc < cam_arc - span * 0.5f;
+							real_t rank = behind ? cam_arc - arc : MAX(arc - cam_arc, 0.f);
+							add_want(Vector2i(x, y), tier, rank, 0.f, behind, rank);
 						}
 					}
 				}
@@ -359,7 +391,7 @@ void Terrain3DStreamer::step() {
 			for (int x = c0.x; x <= c1.x; x++) {
 				real_t rank = 0.f;
 				if (_shape_hit(s, Vector2i(x, y), 0.f, &rank)) {
-					add_want(Vector2i(x, y), tier, rank, 0.f);
+					add_want(Vector2i(x, y), tier, rank, 0.f, _is_behind(Vector2i(x, y)));
 				}
 			}
 		}
@@ -374,10 +406,11 @@ void Terrain3DStreamer::step() {
 			outside++;
 		}
 	}
-	// A pool smaller than the union keeps the regions nearest the target and defers the rest
+	// A pool smaller than the union keeps what is needed first and defers the rest: regions ahead
+	// of the direction of travel before regions behind it, nearest first, a path by arrival
 	HashSet<Vector2i> deferred;
 	if (keep_active && in_window.size() > data->get_slot_capacity()) {
-		in_window.sort_custom<CamSort>();
+		in_window.sort_custom<DeferSort>();
 		for (int i = data->get_slot_capacity(); i < in_window.size(); i++) {
 			deferred.insert(in_window[i].loc);
 		}
@@ -498,6 +531,7 @@ void Terrain3DStreamer::step() {
 	struct Landing {
 		Vector2i loc;
 		String path;
+		bool behind = false;
 		int tier = 2;
 		real_t rank = 0.f;
 	};
@@ -535,6 +569,7 @@ void Terrain3DStreamer::step() {
 		l.loc = kv.key;
 		l.path = kv.value;
 		if (wanted.has(kv.key)) {
+			l.behind = wanted[kv.key].behind;
 			l.tier = wanted[kv.key].tier;
 			l.rank = wanted[kv.key].rank;
 		} else {
@@ -550,6 +585,9 @@ void Terrain3DStreamer::step() {
 	}
 	struct LandingSort {
 		bool operator()(const Landing &a, const Landing &b) const {
+			if (a.behind != b.behind) {
+				return b.behind;
+			}
 			if (a.tier != b.tier) {
 				return a.tier < b.tier;
 			}
@@ -861,7 +899,7 @@ bool Terrain3DStreamer::_segment_hit(const KeepShape &p_shape, const int p_index
 }
 
 // Distance along the path of the point closest to p_point
-real_t Terrain3DStreamer::_arc_of(const KeepShape &p_shape, const Vector2 &p_point) const {
+real_t Terrain3DStreamer::_arc_of(const KeepShape &p_shape, const Vector2 &p_point, Vector2 *r_dir) const {
 	real_t best = INFINITY;
 	real_t arc = 0.f;
 	for (int i = 0; i + 1 < p_shape.points.size(); i++) {
@@ -873,9 +911,47 @@ real_t Terrain3DStreamer::_arc_of(const KeepShape &p_shape, const Vector2 &p_poi
 		if (d2 < best) {
 			best = d2;
 			arc = p_shape.arc[i] + t * Math::sqrt(len2);
+			if (r_dir != nullptr && len2 > 0.f) {
+				*r_dir = ab / Math::sqrt(len2);
+			}
 		}
 	}
 	return arc;
+}
+
+// Finds the direction of travel of the keep set: the tangent of the first path at the clipmap
+// target (the target's arc position is also stored on every path), else the first cone's
+// direction. Without either there is no direction and nothing counts as behind.
+void Terrain3DStreamer::_update_axis() {
+	_has_axis = false;
+	for (int i = 0; i < _keep.size(); i++) {
+		KeepShape &s = _keep.write[i];
+		if (s.type == KeepShape::PATH) {
+			Vector2 dir;
+			s.cam_arc = _arc_of(s, _focus_pos, _has_axis ? nullptr : &dir);
+			if (!_has_axis && dir.length_squared() > 0.f) {
+				_axis = dir;
+				_has_axis = true;
+			}
+		}
+	}
+	for (int i = 0; i < _keep.size() && !_has_axis; i++) {
+		if (_keep[i].type == KeepShape::CONE) {
+			_axis = _keep[i].dir;
+			_has_axis = true;
+		}
+	}
+}
+
+// Is a region's center more than half a region behind the clipmap target along the axis?
+// The target's own region never is.
+bool Terrain3DStreamer::_is_behind(const Vector2i &p_region_loc) const {
+	if (!_has_axis || p_region_loc == _focus_loc) {
+		return false;
+	}
+	const real_t span = _region_span();
+	const Vector2 center = (Vector2(p_region_loc) + V2(0.5f)) * span;
+	return (center - _focus_pos).dot(_axis) < -span * 0.5f;
 }
 
 Terrain3DStreamer::KeepShape *Terrain3DStreamer::_find_keep(const int p_id, const KeepShape::Type p_type) {
