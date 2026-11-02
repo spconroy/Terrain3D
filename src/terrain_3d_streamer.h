@@ -53,6 +53,8 @@ private:
 		Vector<Vector2> points; // Path polyline
 		Vector<real_t> arc; // Path: distance along the polyline at each point
 		real_t cam_arc = 0.f; // Path: arc position of the clipmap target, set every step
+		real_t ahead = -1.f; // Path: load only this far ahead of the target along the path, negative = the whole path
+		real_t prefetch = 0.f; // Path: cache bodies this far ahead of the target (beyond ahead), negative = to the end
 		real_t radius = 0.f; // Circle radius, path corridor radius, cone half width
 		real_t length = 0.f; // Cone extent ahead
 		real_t behind = 0.f; // Cone extent behind
@@ -126,6 +128,8 @@ private:
 	HashSet<Vector2i> _discard; // In flight loads to drop when they land
 	bool _collision_dirty = false; // A region landed in range of the dynamic collision; refreshed once at the end of step()
 	bool _keep_dirty = false; // A shape shrank or vanished: the next step evicts to the strict union
+	Vector<Vector2i> _wanted_near; // Wanted regions of the last step, and those only cached ahead of the path's reach
+	Vector<Vector2i> _wanted_cache;
 	int _stat_wanted = 0; // Union stats from the last step
 	int _stat_missing = 0;
 	int _stat_deferred = 0;
@@ -138,10 +142,11 @@ private:
 	real_t _distance_to(const Vector2i &p_region_loc, const Vector2i &p_focus_loc) const;
 	bool _is_wanted(const Vector2i &p_region_loc) const;
 	bool _is_retained(const Vector2i &p_region_loc) const;
-	bool _is_kept(const Vector2i &p_region_loc, const bool p_retain) const;
+	bool _is_kept(const Vector2i &p_region_loc, const bool p_retain, const bool p_cache = false) const;
 	bool _keep_active() const { return !_keep.is_empty() || _camera_scale != 1.f; }
 	real_t _region_span() const;
-	bool _shape_hit(const KeepShape &p_shape, const Vector2i &p_region_loc, const real_t p_expand, real_t *r_rank) const;
+	bool _shape_hit(const KeepShape &p_shape, const Vector2i &p_region_loc, const real_t p_expand, real_t *r_rank, const bool p_cache = false) const;
+	bool _beyond_reach(const KeepShape &p_shape, const real_t p_arc, const bool p_cache) const;
 	bool _segment_hit(const KeepShape &p_shape, const int p_index, const Vector2i &p_region_loc, const real_t p_expand, real_t *r_arc) const;
 	real_t _arc_of(const KeepShape &p_shape, const Vector2 &p_point, Vector2 *r_dir = nullptr) const;
 	void _update_axis();
@@ -207,6 +212,10 @@ public:
 			const real_t p_behind = 0.f, const bool p_destination = false);
 	bool set_keep_circle(const int p_id, const Vector3 &p_center, const real_t p_radius);
 	bool set_keep_path(const int p_id, const PackedVector3Array &p_points, const real_t p_radius);
+	bool set_keep_path_ahead(const int p_id, const real_t p_ahead, const real_t p_prefetch = 0.f);
+	TypedArray<Vector2i> get_wanted_regions(const bool p_cache_only = false) const;
+	TypedArray<Vector2i> get_pending_regions() const;
+	TypedArray<Vector2i> get_cached_regions() const;
 	bool set_keep_cone(const int p_id, const Vector3 &p_origin, const Vector3 &p_direction, const real_t p_length,
 			const real_t p_half_width, const real_t p_behind = 0.f);
 	real_t get_path_ready_distance(const int p_id, const real_t p_from_distance = -1.f) const;

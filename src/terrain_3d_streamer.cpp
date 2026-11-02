@@ -286,10 +286,14 @@ void Terrain3DStreamer::step() {
 		real_t ahead = 0.f;
 		real_t cam_d = 0.f;
 		bool behind = false;
+		bool cache_only = false; // Body only: beyond the reach of a path, requested after everything that is needed
 		real_t defer = 0.f;
 	};
 	struct WantSort {
 		bool operator()(const Want &a, const Want &b) const {
+			if (a.cache_only != b.cache_only) {
+				return b.cache_only;
+			}
 			if (a.behind != b.behind) {
 				return b.behind;
 			}
@@ -323,7 +327,7 @@ void Terrain3DStreamer::step() {
 	};
 	HashMap<Vector2i, Want> wanted;
 	// p_defer < 0 means the distance to the target in meters. A path passes its arrival distance.
-	auto add_want = [&](const Vector2i &p_loc, int p_tier, real_t p_rank, real_t p_ahead, bool p_behind, real_t p_defer = -1.f) {
+	auto add_want = [&](const Vector2i &p_loc, int p_tier, real_t p_rank, real_t p_ahead, bool p_behind, real_t p_defer = -1.f, bool p_cache_only = false) {
 		if (!_known_set.has(p_loc) || _is_failed(p_loc)) {
 			return;
 		}
@@ -334,6 +338,7 @@ void Terrain3DStreamer::step() {
 		w.ahead = p_ahead;
 		w.cam_d = _distance_to(p_loc, floc);
 		w.behind = p_behind;
+		w.cache_only = p_cache_only;
 		w.defer = p_defer >= 0.f ? p_defer : w.cam_d * span;
 		Want *old = wanted.getptr(p_loc);
 		if (old != nullptr) {
@@ -379,7 +384,10 @@ void Terrain3DStreamer::step() {
 							// the target stands in is ahead whichever side of its center the target is
 							const bool behind = arc < cam_arc - span * 0.5f;
 							real_t rank = behind ? cam_arc - arc : MAX(arc - cam_arc, 0.f);
-							add_want(Vector2i(x, y), tier, rank, 0.f, behind, rank);
+							if (_beyond_reach(s, arc, true)) {
+								continue; // Beyond even the prefetch reach
+							}
+							add_want(Vector2i(x, y), tier, rank, 0.f, behind, rank, _beyond_reach(s, arc, false));
 						}
 					}
 				}
@@ -401,7 +409,14 @@ void Terrain3DStreamer::step() {
 	// Split by the region map window; only regions inside it can take a slot
 	Vector<Want> in_window;
 	int outside = 0;
+	_wanted_near.clear();
+	_wanted_cache.clear();
 	for (const KeyValue<Vector2i, Want> &kv : wanted) {
+		if (kv.value.cache_only) {
+			_wanted_cache.push_back(kv.key);
+			continue;
+		}
+		_wanted_near.push_back(kv.key);
 		if (data->get_region_map_index(kv.key) >= 0) {
 			in_window.push_back(kv.value);
 		} else {
@@ -417,7 +432,7 @@ void Terrain3DStreamer::step() {
 			deferred.insert(in_window[i].loc);
 		}
 	}
-	_stat_wanted = (int)wanted.size();
+	_stat_wanted = _wanted_near.size();
 	_stat_outside = outside;
 	_stat_deferred = (int)deferred.size();
 
@@ -509,7 +524,7 @@ void Terrain3DStreamer::step() {
 	if (_keep_dirty) {
 		// New baseline: loads still in flight for area outside the strict union land nowhere
 		for (const KeyValue<Vector2i, String> &kv : _pending) {
-			if (!_is_kept(kv.key, false)) {
+			if (!_is_kept(kv.key, false, true)) {
 				_discard.insert(kv.key);
 			}
 		}
@@ -519,7 +534,7 @@ void Terrain3DStreamer::step() {
 		// Prefetched bodies of keep shapes drop once nothing keeps them
 		Vector<Vector2i> unkept;
 		for (const KeyValue<Vector2i, Ref<Terrain3DRegion>> &kv : _ram_cache) {
-			if (!_is_kept(kv.key, true)) {
+			if (!_is_kept(kv.key, true, true)) {
 				unkept.push_back(kv.key);
 			}
 		}
@@ -554,10 +569,11 @@ void Terrain3DStreamer::step() {
 			drop.push_back(kv.key);
 			continue;
 		}
-		const bool kept = !_discard.has(kv.key) && _is_kept(kv.key, true);
-		if (!kept || data->get_region_map_index(kv.key) < 0) {
-			// Walked away while it loaded, or loaded for a spot beyond the map window:
-			// consume, and keep the body in RAM mode or while a keep shape still wants it
+		const bool kept = !_discard.has(kv.key) && _is_kept(kv.key, true, true);
+		const Want *pending_want = wanted.getptr(kv.key);
+		if (!kept || data->get_region_map_index(kv.key) < 0 || deferred.has(kv.key) || (pending_want != nullptr && pending_want->cache_only)) {
+			// Walked away while it loaded, or loaded for a spot beyond the map window or one the slot pool
+			// cannot hold yet: consume, and keep the body in RAM mode or while a keep shape still wants it
 			Ref<Terrain3DRegion> body = ResourceLoader::get_singleton()->load_threaded_get(kv.value);
 			if (body.is_valid() && (_mode == RAM || (kept && (int)_ram_cache.size() < _keep_cache_limit))) {
 				_finish_body(body, kv.key, kv.value);
@@ -629,7 +645,7 @@ void Terrain3DStreamer::step() {
 	// How far is the nearest wanted region that is not visible yet? Staged and cached regions are not.
 	_stat_nearest = -1.f;
 	for (const KeyValue<Vector2i, Want> &kv : wanted) {
-		if (kv.value.behind || data->has_region(kv.key)) {
+		if (kv.value.cache_only || kv.value.behind || data->has_region(kv.key)) {
 			continue;
 		}
 		const Vector2 rmin = Vector2(kv.key) * span;
@@ -641,7 +657,8 @@ void Terrain3DStreamer::step() {
 	// flight than free slots can absorb. Bodies for spots beyond the window only take IO.
 	int slot_pending = 0;
 	for (const KeyValue<Vector2i, String> &kv : _pending) {
-		if (data->get_region_map_index(kv.key) >= 0) {
+		const Want *w = wanted.getptr(kv.key);
+		if (data->get_region_map_index(kv.key) >= 0 && !deferred.has(kv.key) && (w == nullptr || !w->cache_only)) {
 			slot_pending++;
 		}
 	}
@@ -654,19 +671,35 @@ void Terrain3DStreamer::step() {
 	Vector<Want> cands;
 	for (const KeyValue<Vector2i, Want> &kv : wanted) {
 		const Vector2i &loc = kv.key;
-		if (resident.has(loc) || data->has_region(loc) || _is_failed(loc) || _pending.has(loc) || deferred.has(loc) ||
+		if (resident.has(loc) || data->has_region(loc) || _is_failed(loc) || _pending.has(loc) ||
 				_staged_set.has(loc) || _saving.has(loc)) {
 			continue;
 		}
 		cands.push_back(kv.value);
 	}
 	cands.sort_custom<WantSort>();
+	// Bodies only fetched ahead of a path's reach never delay what is needed: one load slot stays free
+	// for the path while any needed region is still unrequested
+	int cache_pending = 0;
+	for (const KeyValue<Vector2i, String> &kv : _pending) {
+		const Want *w = wanted.getptr(kv.key);
+		cache_pending += (w != nullptr && w->cache_only) ? 1 : 0;
+	}
+	int near_unrequested = 0;
 	for (int i = 0; i < cands.size(); i++) {
 		if (!keep_active && MIN(io_free, slot_free) <= 0) {
 			break;
 		}
 		Vector2i loc = cands[i].loc;
-		const bool in_win = data->get_region_map_index(loc) >= 0;
+		// A region the pool cannot hold yet loads its body into the cache like one beyond the window,
+		// unless it lies behind the direction of travel
+		const bool in_win = data->get_region_map_index(loc) >= 0 && !deferred.has(loc) && !cands[i].cache_only;
+		if (!in_win && cands[i].behind) {
+			continue;
+		}
+		if (cands[i].cache_only && near_unrequested > 0 && cache_pending >= _concurrent_loads - 1) {
+			continue;
+		}
 		if (_ram_cache.has(loc)) {
 			// Cached body (RAM mode revisit or a prefetch for a keep shape): it is already
 			// decoded, only the GPU upload remains. Still bounded by loads_per_frame
@@ -682,10 +715,31 @@ void Terrain3DStreamer::step() {
 			continue;
 		}
 		if (io_free <= 0 || (in_win && slot_free <= 0)) {
+			near_unrequested += cands[i].cache_only ? 0 : 1;
 			continue;
 		}
 		if (!in_win && _mode == DISK && (int)_ram_cache.size() + (int)_pending.size() - slot_pending >= _keep_cache_limit) {
-			continue; // Prefetch beyond the window is capped in DISK mode
+			// Prefetch beyond the window is capped in DISK mode. A needed body takes the place of the
+			// farthest one fetched ahead of a path's reach
+			bool made_room = false;
+			if (!cands[i].cache_only) {
+				Vector2i victim;
+				real_t far_rank = -1.f;
+				for (const KeyValue<Vector2i, Ref<Terrain3DRegion>> &kv : _ram_cache) {
+					const Want *w = wanted.getptr(kv.key);
+					if (w != nullptr && w->cache_only && w->rank > far_rank) {
+						far_rank = w->rank;
+						victim = kv.key;
+					}
+				}
+				if (far_rank >= 0.f) {
+					_ram_cache.erase(victim);
+					made_room = true;
+				}
+			}
+			if (!made_room) {
+				continue;
+			}
 		}
 		Error err = _request_load(loc, dir);
 		if (err == ERR_BUSY) {
@@ -695,6 +749,7 @@ void Terrain3DStreamer::step() {
 			_mark_failed(loc);
 			continue;
 		}
+		cache_pending += cands[i].cache_only ? 1 : 0;
 		io_free--;
 		if (in_win) {
 			slot_free--;
@@ -823,13 +878,13 @@ real_t Terrain3DStreamer::_region_span() const {
 
 // Is a region inside the focus area or any keep shape? Retaining adds the hysteresis band
 // of one region to every shape; wanting is the strict union that loads.
-bool Terrain3DStreamer::_is_kept(const Vector2i &p_region_loc, const bool p_retain) const {
+bool Terrain3DStreamer::_is_kept(const Vector2i &p_region_loc, const bool p_retain, const bool p_cache) const {
 	if (_camera_scale > 0.f && (p_retain ? _is_retained(p_region_loc) : _is_wanted(p_region_loc))) {
 		return true;
 	}
 	const real_t expand = p_retain ? _region_span() : 0.f;
 	for (int i = 0; i < _keep.size(); i++) {
-		if (_shape_hit(_keep[i], p_region_loc, expand, nullptr)) {
+		if (_shape_hit(_keep[i], p_region_loc, expand, nullptr, p_cache)) {
 			return true;
 		}
 	}
@@ -840,13 +895,25 @@ bool Terrain3DStreamer::_is_kept(const Vector2i &p_region_loc, const bool p_reta
 // region's footprint. A cone is an ellipse half grown by half a region, so it keeps every
 // region it overlaps and the one around its origin. r_rank receives the load rank: the
 // distance from the shape's anchor in regions, or the distance along the path.
-bool Terrain3DStreamer::_shape_hit(const KeepShape &p_shape, const Vector2i &p_region_loc, const real_t p_expand, real_t *r_rank) const {
+// Is a path arc position past how far ahead of the target the path loads (or, for the cache, prefetches)?
+bool Terrain3DStreamer::_beyond_reach(const KeepShape &p_shape, const real_t p_arc, const bool p_cache) const {
+	if (p_shape.ahead < 0.f) {
+		return false;
+	}
+	real_t reach = p_shape.ahead;
+	if (p_cache) {
+		reach = p_shape.prefetch < 0.f ? INFINITY : MAX(reach, p_shape.prefetch);
+	}
+	return p_arc > p_shape.cam_arc + reach + _region_span() * 0.5f;
+}
+
+bool Terrain3DStreamer::_shape_hit(const KeepShape &p_shape, const Vector2i &p_region_loc, const real_t p_expand, real_t *r_rank, const bool p_cache) const {
 	if (p_shape.type == KeepShape::PATH) {
 		bool hit = false;
 		real_t best = INFINITY;
 		for (int i = 0; i + 1 < p_shape.points.size(); i++) {
 			real_t arc = 0.f;
-			if (_segment_hit(p_shape, i, p_region_loc, p_expand, &arc)) {
+			if (_segment_hit(p_shape, i, p_region_loc, p_expand, &arc) && !_beyond_reach(p_shape, arc, p_cache)) {
 				hit = true;
 				best = MIN(best, arc);
 			}
@@ -1216,6 +1283,47 @@ bool Terrain3DStreamer::set_keep_cone(const int p_id, const Vector3 &p_origin, c
 	return true;
 }
 
+// How far ahead of the clipmap target along the path it loads: regions further than p_ahead meters are not
+// wanted, so they take no slot, load order or stat. p_prefetch reaches further, for region bodies only (the
+// RAM cache), requested after everything needed and never using the last load slot while one is waiting;
+// negative means to the end of the path. A negative p_ahead restores the whole path.
+bool Terrain3DStreamer::set_keep_path_ahead(const int p_id, const real_t p_ahead, const real_t p_prefetch) {
+	KeepShape *s = _find_keep(p_id, KeepShape::PATH);
+	if (s == nullptr) {
+		return false;
+	}
+	s->ahead = p_ahead < 0.f ? -1.f : p_ahead;
+	s->prefetch = p_prefetch;
+	return true;
+}
+
+// The regions the last step wanted: those needed now, or (cache_only) only fetched ahead as bodies
+TypedArray<Vector2i> Terrain3DStreamer::get_wanted_regions(const bool p_cache_only) const {
+	TypedArray<Vector2i> out;
+	const Vector<Vector2i> &src = p_cache_only ? _wanted_cache : _wanted_near;
+	for (int i = 0; i < src.size(); i++) {
+		out.push_back(src[i]);
+	}
+	return out;
+}
+
+// The regions with a threaded load in flight, and those whose body waits in the RAM cache
+TypedArray<Vector2i> Terrain3DStreamer::get_pending_regions() const {
+	TypedArray<Vector2i> out;
+	for (const KeyValue<Vector2i, String> &kv : _pending) {
+		out.push_back(kv.key);
+	}
+	return out;
+}
+
+TypedArray<Vector2i> Terrain3DStreamer::get_cached_regions() const {
+	TypedArray<Vector2i> out;
+	for (const KeyValue<Vector2i, Ref<Terrain3DRegion>> &kv : _ram_cache) {
+		out.push_back(kv.key);
+	}
+	return out;
+}
+
 // Removing a shape evicts what only it kept at the next step, without hysteresis
 void Terrain3DStreamer::remove_keep(const int p_id) {
 	for (int i = 0; i < _keep.size(); i++) {
@@ -1511,6 +1619,10 @@ void Terrain3DStreamer::_bind_methods() {
 			&Terrain3DStreamer::set_keep_cone, DEFVAL(0.f));
 	ClassDB::bind_method(D_METHOD("get_path_ready_distance", "id", "from_distance"), &Terrain3DStreamer::get_path_ready_distance, DEFVAL(-1.f));
 	ClassDB::bind_method(D_METHOD("get_path_cost", "points", "radius"), &Terrain3DStreamer::get_path_cost);
+	ClassDB::bind_method(D_METHOD("set_keep_path_ahead", "id", "ahead", "prefetch"), &Terrain3DStreamer::set_keep_path_ahead, DEFVAL(0.f));
+	ClassDB::bind_method(D_METHOD("get_wanted_regions", "cache_only"), &Terrain3DStreamer::get_wanted_regions, DEFVAL(false));
+	ClassDB::bind_method(D_METHOD("get_pending_regions"), &Terrain3DStreamer::get_pending_regions);
+	ClassDB::bind_method(D_METHOD("get_cached_regions"), &Terrain3DStreamer::get_cached_regions);
 	ClassDB::bind_method(D_METHOD("remove_keep", "id"), &Terrain3DStreamer::remove_keep);
 	ClassDB::bind_method(D_METHOD("clear_keep"), &Terrain3DStreamer::clear_keep);
 	ClassDB::bind_method(D_METHOD("get_keep_count"), &Terrain3DStreamer::get_keep_count);
