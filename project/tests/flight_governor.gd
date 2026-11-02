@@ -123,7 +123,7 @@ var _win_sat := 0.0
 var _win_loads := -1
 var _observed := false
 var _unsat_time := 0.0
-var _limit_seen := false
+var limit_seen := false ## The loader has limited this flight at some point
 
 var start_altitude := 0.0
 var cruise_altitude := 0.0
@@ -229,7 +229,7 @@ func setup(path_length: float, heights: PackedFloat32Array, sample_step: float, 
 	_win_loads = -1
 	_observed = false
 	_unsat_time = 0.0
-	_limit_seen = false
+	limit_seen = false
 	safety_full = -1.0
 	distance = 0.0
 	speed = 0.0
@@ -325,7 +325,7 @@ func soft_target() -> float:
 	# Once the loader has limited the flight the speed is held at a share of its rate when everything ahead is
 	# loaded, so the flight is one smooth profile and does not speed up at the end
 	if is_inf(ready_soft):
-		return clampf(cruise_fraction * rate_hold, floor_fraction * max_speed, max_speed) if _limit_seen else INF
+		return clampf(cruise_fraction * rate_hold, floor_fraction * max_speed, max_speed) if limit_seen else INF
 	# A healthy buffer (ready above the margin) lets the speed exceed the measured disk rate: regions that come from
 	# the RAM cache do not advance the front by disk loads, so the rate is a floor of the throughput, not a ceiling
 	var margin := safety + stop_distance(speed, max_accel * brake_fraction, max_jerk) + speed * margin_look
@@ -365,7 +365,7 @@ func step(delta: float, ready_distance: float = INF) -> void:
 	adapting = soft and v_soft < v_hard and v_soft < max_speed * 0.995
 	var ready_brake := INF if is_inf(ready_filtered) else speed_for_distance(ready_filtered - safety, max_accel * brake_fraction, max_jerk)
 	var loader_limited := soft and rate_valid and minf(v_soft, ready_brake) < max_speed * 0.97
-	_limit_seen = _limit_seen or loader_limited
+	limit_seen = limit_seen or loader_limited
 	if rate_valid:
 		rate_hold = rate_est if rate_hold <= 0.0 else lerpf(rate_hold, rate_est, 1.0 - exp(-dt / rate_hold_tau))
 	if soft and rate_valid and limited and _unsat_time >= 0.5:
@@ -377,10 +377,12 @@ func step(delta: float, ready_distance: float = INF) -> void:
 	if adapting:
 		# Smooth loader limited speed: a fraction of the normal deceleration and jerk, no braking curve
 		# Once the loader has limited the flight both directions change gently; before that the take-off accelerates
-		# normally. Where the gentle jerk could not stop the speed at the target in time, the full jerk is used.
-		var a_lim := max_accel * soft_decel_fraction if (v_target < speed or _limit_seen) else max_accel
+		# normally
+		var a_lim := max_accel * soft_decel_fraction if (v_target < speed or limit_seen) else max_accel
 		var j_soft := max_jerk * soft_jerk_fraction
-		var j_use := j_soft if (accel <= 0.0 or speed + accel * accel / (2.0 * j_soft) <= v_target * 1.02) else max_jerk
+		# Where the gentle jerk could not settle the speed at the target in time (it would overshoot by more than 15 %),
+		# the full jerk is used: a slow response to a quickly falling target would oscillate
+		var j_use := j_soft if (accel <= 0.0 or speed + accel * accel / (2.0 * j_soft) <= v_target * 1.15) else max_jerk
 		accel = track(speed, accel, v_target, a_lim, j_use, dt)
 	elif v_target < max_speed - 1.0:
 		# A braking constraint is active. Its target falls along the stopping curve as the camera

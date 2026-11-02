@@ -432,7 +432,8 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		var ready := s.get_path_ready_distance(path_id)
 		if governed:
 			var saturated: bool = st.inflight >= cfg.conc
-			g.observe_loader(dt, int(st.disk_loads_needed), saturated, mpl_now)
+			# With the whole route prefetched, near regions are inserted from the cache: the sustainable rate is the insertion rate
+			g.observe_loader(dt, int(st.landed_total if prefetch_all else st.disk_loads_needed), saturated, mpl_now)
 			var front := g.distance + ready
 			if saturated and ready < remaining - 1.0 and prev_front >= 0.0 and not activated:
 				sat_time += dt
@@ -474,7 +475,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		elif m.arrive < 0.0:
 			m.arrive = t
 		prev_a = g.accel
-		if g.adapting:
+		if g.adapting and g.limit_seen:
 			m.adapt_frames += 1
 			m.adapt_a = maxf(m.adapt_a, absf(g.accel))
 			m.adapt_j = maxf(m.adapt_j, absf(g.jerk))
