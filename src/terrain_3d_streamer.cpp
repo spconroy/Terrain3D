@@ -164,6 +164,12 @@ void Terrain3DStreamer::scan_directory() {
 		if (loc.x == INT32_MAX) {
 			continue; // Sibling non-region file
 		}
+		if (Terrain3DData::get_region_map_index(loc) < 0) {
+			// A body cannot keep a location outside the 32x32 region map: it would land
+			// at the wrong place and be evicted again every frame, starving real loads
+			LOG(WARN, "Streaming scan: ignoring ", fname, ", location ", loc, " is outside the world");
+			continue;
+		}
 		_known.push_back(loc);
 		_known_set.insert(loc);
 	}
