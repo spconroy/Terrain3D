@@ -7,7 +7,7 @@ extends SceneTree
 var _fail := 0
 var _done := false
 var _t: Terrain3D
-var _dir := "user://stream_test_data"
+var _dir := "user://stream_test_data_%d" % OS.get_process_id()
 
 
 func ok(c: bool, m: String) -> void:
@@ -18,9 +18,9 @@ func ok(c: bool, m: String) -> void:
 
 func _initialize() -> void:
 	var d := DirAccess.open("user://")
-	if d != null and d.dir_exists("stream_test_data"):
+	if d != null and d.dir_exists(_dir.get_file()):
 		for f in DirAccess.get_files_at(_dir):
-			d.remove("stream_test_data/" + f)
+			d.remove(_dir.get_file() + "/" + f)
 	else:
 		DirAccess.make_dir_recursive_absolute(_dir)
 	_t = Terrain3D.new()
