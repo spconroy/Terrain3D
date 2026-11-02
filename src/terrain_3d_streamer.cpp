@@ -187,6 +187,7 @@ void Terrain3DStreamer::step() {
 	String dir = _terrain->get_data_directory();
 	Vector3 focus = _terrain->get_clipmap_target_position();
 	Vector2i floc = data->get_region_location(focus);
+	_focus_loc = floc;
 	// Region locations are unbounded, the region map window is not. Recentre it on the
 	// focus whenever the retained area (distance + 1, see eviction below) leaves it.
 	// Regions left outside are beyond the retained area, so they evict below.
@@ -217,7 +218,7 @@ void Terrain3DStreamer::step() {
 	Vector<Vector2i> stale;
 	for (int i = 0; i < loaded.size(); i++) {
 		Vector2i loc = loaded[i];
-		if (_distance_to(loc, floc) > real_t(_distance + 1)) {
+		if (!_is_retained(loc)) {
 			stale.push_back(loc);
 		}
 	}
@@ -258,7 +259,7 @@ void Terrain3DStreamer::step() {
 			continue;
 		}
 		real_t d = _distance_to(kv.key, floc);
-		if (d > real_t(_distance + 1)) {
+		if (!_is_retained(kv.key)) {
 			// Walked away while it loaded: consume, and in RAM mode keep the body
 			Ref<Terrain3DRegion> body = ResourceLoader::get_singleton()->load_threaded_get(kv.value);
 			if (_mode == RAM && body.is_valid()) {
@@ -336,7 +337,7 @@ void Terrain3DStreamer::step() {
 				continue;
 			}
 			real_t d = _distance_to(loc, floc);
-			if (d > real_t(_distance)) {
+			if (!_is_wanted(loc)) {
 				continue; // Corner outside a circular area
 			}
 			Cand c;
@@ -430,6 +431,16 @@ real_t Terrain3DStreamer::_distance_to(const Vector2i &p_region_loc, const Vecto
 		return Vector2(d).length();
 	}
 	return real_t(MAX(ABS(d.x), ABS(d.y)));
+}
+
+// A region is wanted (loaded) within distance of the focus, and retained (kept once loaded)
+// within one more region of hysteresis so it does not thrash at the edge
+bool Terrain3DStreamer::_is_wanted(const Vector2i &p_region_loc) const {
+	return _distance_to(p_region_loc, _focus_loc) <= real_t(_distance);
+}
+
+bool Terrain3DStreamer::_is_retained(const Vector2i &p_region_loc) const {
+	return _distance_to(p_region_loc, _focus_loc) <= real_t(_distance + 1);
 }
 
 // A streamed insertion only matters to collision when the region can intersect the

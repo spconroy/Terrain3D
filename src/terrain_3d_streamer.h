@@ -55,12 +55,15 @@ private:
 	int _prefetch_cursor = 0; // RAM mode: background walk of _known filling the cache
 	Vector2 _travel_dir; // Moving average of target motion, breaks load order ties
 	Vector2 _last_focus;
+	Vector2i _focus_loc; // Region location of the clipmap target, set every step
 	bool _has_last_focus = false;
 	uint64_t _landed_total = 0; // Counters for get_stats()
 	uint64_t _evicted_total = 0;
 	real_t _land_ms_avg = 0.f;
 
 	real_t _distance_to(const Vector2i &p_region_loc, const Vector2i &p_focus_loc) const;
+	bool _is_wanted(const Vector2i &p_region_loc) const;
+	bool _is_retained(const Vector2i &p_region_loc) const;
 	void _collision_refresh(const Vector2i &p_region_loc);
 	void _flush_ram_cache();
 
