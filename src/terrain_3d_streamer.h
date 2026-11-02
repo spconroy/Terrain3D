@@ -46,6 +46,16 @@ private:
 	int _loads_per_frame = 1; // Loaded regions inserted per physics frame
 	bool _persist_edits = false; // Write a modified region back to disk when it is evicted
 
+	// Optional location -> {path, rotation, mirror, read_only} override, called on the main thread
+	Callable _resolver;
+	struct Resolved {
+		int rotation = 0;
+		bool mirror = false;
+		bool read_only = false;
+	};
+	HashMap<Vector2i, Resolved> _resolved; // Pending locations that used the resolver
+	HashSet<Vector2i> _virtual; // Locations registered without a file of their own
+
 	// Work data
 	Vector<Vector2i> _known; // Region locations present on disk
 	HashSet<Vector2i> _known_set;
@@ -64,6 +74,8 @@ private:
 	void _apply_distance_limit();
 	void _collision_refresh(const Vector2i &p_region_loc);
 	void _flush_ram_cache();
+	Error _request_load(const Vector2i &p_loc, const String &p_dir);
+	void _finish_body(const Ref<Terrain3DRegion> &p_region, const Vector2i &p_loc, const String &p_path);
 
 public:
 	Terrain3DStreamer() {}
@@ -89,6 +101,11 @@ public:
 	int get_loads_per_frame() const { return _loads_per_frame; }
 	void set_persist_edits(const bool p_enabled) { _persist_edits = p_enabled; }
 	bool get_persist_edits() const { return _persist_edits; }
+
+	void set_resolver(const Callable &p_resolver);
+	Callable get_resolver() const { return _resolver; }
+	void register_virtual_locations(const TypedArray<Vector2i> &p_locations);
+	void clear_virtual_locations();
 
 	void scan_directory();
 	void step();
