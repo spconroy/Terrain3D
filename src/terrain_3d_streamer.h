@@ -71,6 +71,7 @@ private:
 	bool _persist_edits = false; // Write a modified region back to disk when it is evicted
 	real_t _camera_scale = 1.f; // Scales the clipmap target's own area, 0 removes it
 	int _keep_cache_limit = 128; // Regions outside the map window whose bodies may be cached
+	real_t _behind_limit = -1.f; // Keep nothing further than this behind the direction of travel, negative = no limit
 	real_t _frame_budget_ms = 2.f; // Main thread time for insertions and evictions per physics frame, 0 = loads_per_frame
 
 	// A region whose texture layers are being uploaded over several frames
@@ -144,6 +145,7 @@ private:
 	real_t _arc_of(const KeepShape &p_shape, const Vector2 &p_point, Vector2 *r_dir = nullptr) const;
 	void _update_axis();
 	bool _is_behind(const Vector2i &p_region_loc) const;
+	bool _cut_behind(const Vector2i &p_region_loc) const;
 	KeepShape *_find_keep(const int p_id, const KeepShape::Type p_type);
 	void _set_path(KeepShape &p_shape, const PackedVector3Array &p_points);
 	void _collision_refresh(const Vector2i &p_region_loc);
@@ -193,6 +195,8 @@ public:
 	void set_camera_scale(const real_t p_scale);
 	real_t get_camera_scale() const { return _camera_scale; }
 	void set_keep_cache_limit(const int p_limit) { _keep_cache_limit = CLAMP(p_limit, 0, 4096); }
+	void set_behind_limit(const real_t p_distance);
+	real_t get_behind_limit() const { return _behind_limit; }
 	int get_keep_cache_limit() const { return _keep_cache_limit; }
 
 	int add_keep_circle(const Vector3 &p_center, const real_t p_radius, const bool p_destination = false);

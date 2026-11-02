@@ -847,6 +847,9 @@ bool Terrain3DStreamer::_shape_hit(const KeepShape &p_shape, const Vector2i &p_r
 	const Vector2 rmin = Vector2(p_region_loc) * span;
 	const Vector2 rmax = rmin + V2(span);
 	const Vector2 center = rmin + V2(span * 0.5f);
+	if (!p_shape.destination && _cut_behind(p_region_loc)) {
+		return false;
+	}
 	if (r_rank != nullptr) {
 		*r_rank = (center - p_shape.point).length() / span;
 	}
@@ -888,12 +891,17 @@ bool Terrain3DStreamer::_segment_hit(const KeepShape &p_shape, const int p_index
 	if (d2 > r * r) {
 		return false;
 	}
-	if (r_arc != nullptr) {
+	if (r_arc != nullptr || _behind_limit >= 0.f) {
 		const Vector2 ab = b - a;
 		const real_t len2 = ab.length_squared();
 		const real_t t = len2 > 0.f ? CLAMP((rmin + V2(span * 0.5f) - a).dot(ab) / len2, 0.f, 1.f) : 0.f;
 		const real_t arc = p_shape.arc[p_index] + t * Math::sqrt(len2);
-		*r_arc = arc;
+		if (_behind_limit >= 0.f && arc < p_shape.cam_arc - _behind_limit - span * 0.5f) {
+			return false; // Further behind the target than behind_limit
+		}
+		if (r_arc != nullptr) {
+			*r_arc = arc;
+		}
 	}
 	return true;
 }
@@ -943,6 +951,18 @@ void Terrain3DStreamer::_update_axis() {
 	}
 }
 
+// Is a region beyond behind_limit from the clipmap target, against the direction of travel?
+// Used by every shape and the target's own area, so nothing keeps what the camera left behind.
+// Destination shapes skip it, and the target's own region is never cut.
+bool Terrain3DStreamer::_cut_behind(const Vector2i &p_region_loc) const {
+	if (_behind_limit < 0.f || !_has_axis || p_region_loc == _focus_loc) {
+		return false;
+	}
+	const real_t span = _region_span();
+	const Vector2 center = (Vector2(p_region_loc) + V2(0.5f)) * span;
+	return (center - _focus_pos).dot(_axis) < -(_behind_limit + span * 0.5f);
+}
+
 // Is a region's center more than half a region behind the clipmap target along the axis?
 // The target's own region never is.
 bool Terrain3DStreamer::_is_behind(const Vector2i &p_region_loc) const {
@@ -985,6 +1005,16 @@ void Terrain3DStreamer::set_camera_scale(const real_t p_scale) {
 		_keep_dirty = true;
 	}
 	_camera_scale = scale;
+}
+
+// Nothing is kept further than p_distance behind the clipmap target, against the direction of
+// travel (see _update_axis). Lowering it evicts what it cuts at once, like a shrinking shape.
+void Terrain3DStreamer::set_behind_limit(const real_t p_distance) {
+	const real_t limit = p_distance < 0.f ? -1.f : p_distance;
+	if (limit >= 0.f && (_behind_limit < 0.f || limit < _behind_limit)) {
+		_keep_dirty = true;
+	}
+	_behind_limit = limit;
 }
 
 int Terrain3DStreamer::add_keep_circle(const Vector3 &p_center, const real_t p_radius, const bool p_destination) {
@@ -1093,11 +1123,11 @@ void Terrain3DStreamer::clear_keep() {
 // A region is wanted (loaded) within distance of the focus, and retained (kept once loaded)
 // within one more region of hysteresis so it does not thrash at the edge
 bool Terrain3DStreamer::_is_wanted(const Vector2i &p_region_loc) const {
-	return _distance_to(p_region_loc, _focus_loc) <= real_t(_distance) * _camera_scale;
+	return _distance_to(p_region_loc, _focus_loc) <= real_t(_distance) * _camera_scale && !_cut_behind(p_region_loc);
 }
 
 bool Terrain3DStreamer::_is_retained(const Vector2i &p_region_loc) const {
-	return _distance_to(p_region_loc, _focus_loc) <= real_t(_distance) * _camera_scale + 1.f;
+	return _distance_to(p_region_loc, _focus_loc) <= real_t(_distance) * _camera_scale + 1.f && !_cut_behind(p_region_loc);
 }
 
 // Hands an evicted body to a worker thread. A body with edits is saved first when
@@ -1355,6 +1385,8 @@ void Terrain3DStreamer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_camera_scale"), &Terrain3DStreamer::get_camera_scale);
 	ClassDB::bind_method(D_METHOD("set_keep_cache_limit", "limit"), &Terrain3DStreamer::set_keep_cache_limit);
 	ClassDB::bind_method(D_METHOD("get_keep_cache_limit"), &Terrain3DStreamer::get_keep_cache_limit);
+	ClassDB::bind_method(D_METHOD("set_behind_limit", "distance"), &Terrain3DStreamer::set_behind_limit);
+	ClassDB::bind_method(D_METHOD("get_behind_limit"), &Terrain3DStreamer::get_behind_limit);
 	ClassDB::bind_method(D_METHOD("add_keep_circle", "center", "radius", "destination"), &Terrain3DStreamer::add_keep_circle, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("add_keep_path", "points", "radius"), &Terrain3DStreamer::add_keep_path);
 	ClassDB::bind_method(D_METHOD("add_keep_cone", "origin", "direction", "length", "half_width", "behind", "destination"),
@@ -1388,4 +1420,5 @@ void Terrain3DStreamer::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "persist_edits"), "set_persist_edits", "get_persist_edits");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "camera_scale", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_camera_scale", "get_camera_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "keep_cache_limit", PROPERTY_HINT_RANGE, "0,4096,1"), "set_keep_cache_limit", "get_keep_cache_limit");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "behind_limit", PROPERTY_HINT_RANGE, "-1,100000,1,or_greater,suffix:m"), "set_behind_limit", "get_behind_limit");
 }
