@@ -53,19 +53,20 @@ var brake_tau := 0.15
 ## with a fraction of the normal deceleration and jerk, after the sharp footprint was degraded (quality) before slowing.
 ## The braking distance clamp stays underneath as the hole free failsafe. Turn off for the v1 behaviour.
 var soft := true
-var soft_k := 0.8 ## 1/s: speed change per meter of ready distance above or below the desired margin
+var soft_k := 0.4 ## 1/s: speed change per meter of ready distance above or below the desired margin
 var soft_decel_fraction := 0.35 ## of max_accel while adapting
 var soft_jerk_fraction := 0.3 ## of max_jerk while adapting
 var cruise_fraction := 0.88 ## cruise speed as a share of the measured sustainable rate
 var floor_fraction := 0.3 ## the soft law never asks for less than this share of the cap
-var margin_look := 0.8 ## s of travel kept as a buffer on top of safety and the stopping distance
+var margin_look := 0.25 ## s of travel kept as a buffer on top of safety and the stopping distance
 var rate_tau := 2.0 ## s, time constant of a rise of the sustainable rate estimate (low bandwidth)
 var rate_tau_down := 0.7 ## s, time constant of a fall (a loader that slows is believed sooner than one that speeds up)
 var rate_window := 0.5 ## s, length of one throughput sample
 var stretch_until := 1.75 ## s: while no estimate exists yet, accelerate with stretch_accel x max_accel until here
 var stretch_accel := 0.6
-## Sharp footprint quality, 1 = full. It falls (quality_rate per s) while the loader limits the speed and recovers at
-## half that; the caller scales the corridor radius, cone width and margins with it. The governor scales safety by
+## Sharp footprint quality, 1 = full. It falls (quality_rate per s) while the loader limits the speed and does NOT recover
+## during the flight (widening the corridor again would put missing regions right ahead of the camera); the caller
+## restores it at landing with restore_quality(). The caller scales the corridor radius, cone width and margins with it. The governor scales safety by
 ## lerp(far_min_fraction, 1, quality).
 var quality := 1.0
 var quality_min := 0.45
@@ -159,6 +160,11 @@ func observe_loader(delta: float, disk_loads_total: int, saturated: bool, metres
 	_win_t = 0.0
 	_win_sat = 0.0
 	_win_loads = disk_loads_total
+
+
+## Landed: the footprint goes back to full
+func restore_quality() -> void:
+	quality = 1.0
 
 
 ## Distance in which a jerk limited stop from v completes
@@ -351,8 +357,6 @@ func step(delta: float, ready_distance: float = INF) -> void:
 	if soft:
 		if adapting and rate_valid:
 			quality = maxf(quality - quality_rate * dt, quality_min) # Shrink the sharp footprint before slowing further
-		elif v_soft >= max_speed * 0.995 or not rate_valid:
-			quality = minf(quality + quality_rate * 0.5 * dt, 1.0)
 	if adapting:
 		# Smooth loader limited speed: a fraction of the normal deceleration and jerk, no braking curve
 		var a_lim := max_accel * soft_decel_fraction if v_target < speed else max_accel

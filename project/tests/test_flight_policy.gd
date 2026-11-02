@@ -130,7 +130,7 @@ func _pct(a: Array, p: float) -> float:
 
 
 func _base_cfg() -> Dictionary:
-	return {"label": "", "rs": 512, "length": 10000.0, "governed": true, "cap": CAP, "conc": 3, "lpf": 1, "budget": 2.0, "slots": 160,
+	return {"label": "", "rs": 512, "length": 10000.0, "governed": true, "soft": true, "cap": -1.0, "conc": 3, "lpf": 1, "budget": 2.0, "slots": 160,
 			"prefetch": true, "ram_budget": 3.0e9, "lookahead": true, "collision": "off", "csv": false, "timeout": 150.0, "expect_zero": true}
 
 
@@ -161,6 +161,18 @@ func _run() -> void:
 		plan.append(_cfg(b, "%d m 10 km governed 5 km/s cap, slow loads" % rs, {"cap": 5000.0, "conc": 1, "prefetch": false}))
 		plan.append(_cfg(b, "%d m 28 km governed, prefetch" % rs, {"length": 28000.0, "csv": rs == 512}))
 		plan.append(_cfg(b, "%d m 28 km governed, load as you go" % rs, {"length": 28000.0, "prefetch": false}))
+		# Governor v2: the soft law against the v1 braking clamp, with loaders slowed three ways (one load in flight, a
+		# 0.5 ms insertion budget that makes every region take several frames, both)
+		for variant: Array in [["conc 1", {"conc": 1}], ["budget 0.5 ms", {"budget": 0.5}], ["conc 1 + budget 0.5 ms", {"conc": 1, "budget": 0.5}]]:
+			var vo: Dictionary = variant[1]
+			vo.merge({"length": 28000.0, "prefetch": false}, true)
+			plan.append(_cfg(b, "%d m 28 km v2 soft, %s" % [rs, variant[0]], vo))
+			var vo1 := vo.duplicate()
+			vo1.merge({"soft": false}, true)
+			plan.append(_cfg(b, "%d m 28 km v1 hard clamp, %s" % [rs, variant[0]], vo1))
+		# An artificially slowed loader: a 0.05 ms budget lets only one upload step of one region run per frame
+		plan.append(_cfg(b, "%d m 10 km v2 soft, one upload step per frame" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "timeout": 400.0}))
+		plan.append(_cfg(b, "%d m 10 km v1 hard clamp, one upload step per frame" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "soft": false, "timeout": 400.0}))
 	# Frame pacing: dynamic collision refresh and the frame budget
 	for rs: int in sizes:
 		var cb := _base_cfg()
@@ -317,7 +329,10 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			break
 	# The plan: cruise altitude from the terrain profile, the sharp footprint from it, corridor from the footprint
 	var g := FlightGovernor.new()
-	g.max_speed = cfg.cap
+	g.soft = cfg.soft
+	if cfg.cap > 0.0:
+		g.auto_cap = false
+		g.max_speed = cfg.cap
 	var heights := _heights(length)
 	g.setup(length, heights, 50.0, _ground(0.0), _ground(length))
 	var fp := FlightGovernor.view_footprint(g.cruise_altitude, g.base_pitch_deg, g.base_fov)
@@ -326,6 +341,16 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	g.safety = far
 	var pts := PackedVector3Array([Vector3(start.x, 0, start.y), Vector3(dest.x, 0, dest.y)])
 	var cost: Dictionary = s.get_path_cost(pts, radius)
+	# Footprint quality: the corridor radius falls from the derived one to half of it before the camera slows. A load
+	# advances the front by span / (regions in one column of the corridor)
+	var radius_full := radius
+	var radius_min := 0.5 * radius_full
+	var mpl_cache := {}
+	var q_applied := 20
+	var radius_q := radius_full
+	var cols := length / sp
+	var mpl_now: float = sp / maxf(float(cost.regions) / cols, 1.0)
+	mpl_cache[20] = mpl_now
 	var ahead := -1.0
 	if cfg.lookahead:
 		ahead = fp.far + FlightGovernor.stop_distance(g.max_speed, g.max_accel * g.brake_fraction, g.max_jerk) + g.max_speed * 1.0
@@ -359,7 +384,17 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	var col_start: int = s.get_stats().collision_refreshes
 	if cfg.collision == "suspend":
 		_t.collision_mode = Terrain3DCollision.DISABLED
-	var m := {"ticks": 0, "holes": 0, "holes_near": 0, "behind_age_max": 0, "arrive": -1.0, "complete": -1.0, "peak_v": 0.0,
+	var sat_time := 0.0
+	var sat_loads := 0
+	var sat_mpl := 0.0
+	var front_adv := 0.0
+	var est_sum := 0.0
+	var est_n := 0
+	var prev_front := -1.0
+	var sat_prev_loads: int = s.get_stats().disk_loads_needed
+	var mid_speeds: Array[float] = []
+	var mid_dvdt: Array[float] = []
+	var m := {"quality_min": 1.0, "adapt_a": 0.0, "adapt_j": 0.0, "adapt_frames": 0, "ticks": 0, "holes": 0, "holes_near": 0, "behind_age_max": 0, "arrive": -1.0, "complete": -1.0, "peak_v": 0.0,
 			"min_ready": INF, "resident_max": 0, "da_ratio": 0.0, "dv_max": 0.0, "dv_frames": 0, "peak_a": 0.0, "peak_j": 0.0,
 			"first_ring": -1.0, "act": -1.0, "corridor_done": -1.0, "wanted_behind": 0, "ring_early": 0, "order_violations": 0,
 			"ring_missing": -1, "ring_whole": -1, "ring_check": false, "lead_dist_min": INF, "lead_t_min": INF, "late_inserts": 0, "recentres": 0, "recentre_log": [], "wanted_missing": -1, "landed_start": s.get_stats().landed_total, "tick_ms": [], "phys_ms": [],
@@ -395,7 +430,27 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		var remaining := length - g.distance
 		var ready := s.get_path_ready_distance(path_id)
 		if governed:
+			var saturated: bool = st.inflight >= cfg.conc
+			g.observe_loader(dt, int(st.disk_loads_needed), saturated, mpl_now)
+			var front := g.distance + ready
+			if saturated and ready < remaining - 1.0 and prev_front >= 0.0 and not activated:
+				sat_time += dt
+				est_sum += g.rate_est if g.rate_valid else 0.0
+				est_n += 1 if g.rate_valid else 0
+				front_adv += front - prev_front + 0.0 # Includes the camera's own travel: front = distance + ready
+			prev_front = front if ready < remaining - 1.0 else -1.0
+			sat_prev_loads = int(st.disk_loads_needed)
 			g.step(dt, ready)
+			# Apply the footprint quality the governor asks for (steps of 0.05)
+			var qi := roundi(g.quality * 20.0)
+			if qi != q_applied:
+				q_applied = qi
+				radius_q = lerpf(radius_min, radius_full, float(qi) / 20.0)
+				if not mpl_cache.has(qi):
+					mpl_cache[qi] = sp / maxf(float(s.get_path_cost(pts, radius_q).regions) / cols, 1.0)
+				mpl_now = mpl_cache[qi]
+				s.set_keep_path(path_id, pts, radius_q)
+			m.quality_min = minf(m.quality_min, g.quality)
 		else:
 			g.step(dt, INF)
 		t += dt
@@ -403,10 +458,12 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		cam.global_position = Vector3(pos.x, g.altitude, pos.y)
 		cam.basis = Basis(Vector3.UP, -PI / 2.0) * Basis(Vector3.RIGHT, g.pitch)
 		cam.fov = g.fov
-		s.set_keep_cone(cone_id, Vector3(pos.x, 0, pos.y), Vector3(1, 0, 0), fp.far, radius, sp)
+		s.set_keep_cone(cone_id, Vector3(pos.x, 0, pos.y), Vector3(1, 0, 0), g.safety if governed else fp.far, radius_q, sp)
 		s.camera_scale = clampf(1.0 - t, 0.0, 1.0)
 		m.ticks += 1
 		m.tick_ms.append(wall_dt * 1000.0)
+		if wall_dt > 0.15:
+			print("DEBUG slow tick %.0f ms at t=%.2f s: quality %.2f (applied %d), resident %d, staged %d, inflight %d" % [wall_dt * 1000.0, t, g.quality, q_applied, st.resident, st.staged, st.inflight])
 		m.phys_ms.append(Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0)
 		m.peak_v = maxf(m.peak_v, g.speed)
 		m.peak_a = maxf(m.peak_a, absf(g.accel))
@@ -416,6 +473,13 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		elif m.arrive < 0.0:
 			m.arrive = t
 		prev_a = g.accel
+		if g.adapting:
+			m.adapt_frames += 1
+			m.adapt_a = maxf(m.adapt_a, absf(g.accel))
+			m.adapt_j = maxf(m.adapt_j, absf(g.jerk))
+		if g.distance > 0.15 * length and g.distance < 0.85 * length:
+			mid_speeds.append(g.speed)
+			mid_dvdt.append((g.speed - prev_v) / dt)
 		m.dv_max = maxf(m.dv_max, absf(g.speed - prev_v))
 		m.dv_frames += 1 if absf(g.speed - prev_v) > 0.03 * g.max_speed else 0
 		prev_v = g.speed
@@ -435,7 +499,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		var holes_near := 0
 		if m.arrive < 0.0 and g.speed > 1.0:
 			var fp_now := FlightGovernor.view_footprint(g.altitude, g.base_pitch_deg, g.base_fov) # The view shrinks as the camera descends
-			var far_now: float = fp_now.far
+			var far_now: float = fp_now.far * lerpf(g.far_min_fraction, 1.0, g.quality if governed and g.soft else 1.0)
 			var x_hi: float = pos.x + far_now
 			for cx in range(cam_loc.x, int(floorf(x_hi / sp)) + 1):
 				for cy in range(cam_loc.y - 6, cam_loc.y + 7):
@@ -443,7 +507,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 					if not known.has(loc):
 						continue
 					var near_x := maxf(float(cx) * sp - pos.x, 0.0)
-					var half: float = maxf(150.0, near_x * (radius - 100.0) / far)
+					var half: float = maxf(150.0, near_x * (radius_q - 100.0) / far)
 					if near_x > far_now:
 						continue
 					var mn_y := float(cy) * sp
@@ -615,6 +679,26 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			m.corridor_done, m.ring_missing, m.resident_max, m.wanted_max, _pct(tick, 0.99), tick.max() if not tick.is_empty() else 0.0, m.peak_j, g.clamp_hits,
 			st_end.ram_cached, cost.regions, float(cost.bytes) / 1048576.0]
 	row += " | lead min %.1f s / %.0f m, recentres %d" % [m.lead_t_min if m.lead_t_min < INF else -1.0, m.lead_dist_min if m.lead_dist_min < INF else -1.0, m.recentres]
+	var cruise := 0.0
+	var vmin := 0.0
+	var wob := 0.0
+	if not mid_speeds.is_empty():
+		var sorted := mid_speeds.duplicate()
+		sorted.sort()
+		cruise = sorted[sorted.size() / 2]
+		vmin = sorted[0]
+		var mean := 0.0
+		for d in mid_dvdt:
+			mean += d
+		mean /= mid_dvdt.size()
+		for d in mid_dvdt:
+			wob += (d - mean) * (d - mean)
+		wob = sqrt(wob / mid_dvdt.size())
+	m["min_frac"] = vmin / maxf(cruise, 1.0)
+	var theory := length / g.max_speed + 1.5
+	var actual_rate := front_adv / sat_time if sat_time > 0.3 else -1.0
+	row += " | v2: cap %.0f cruise %.0f min speed %.2f of cruise, wobble %.0f, adapt a %.0f j %.0f (%d frames), quality min %.2f, lost %.1f s vs cap flight, rate est (mean before the destination) %.0f / actual front advance %.0f m/s" % [
+			g.max_speed, cruise, m.min_frac, wob, m.adapt_a, m.adapt_j, m.adapt_frames, m.quality_min, m.arrive - theory, est_sum / maxf(float(est_n), 1.0) if est_n > 0 else -1.0, actual_rate]
 	if m.has("classes_missing"):
 		row += " | missing at arrival: " + str(m.classes_missing)
 	if cfg.collision != "off":
@@ -641,6 +725,9 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			ok(m.first_ring < 0.0 or m.first_ring >= m.act - 1.0 / 30.0, "%s: the destination's first request (%.2f s) came after its activation (%.2f s)" % [label, m.first_ring, m.act])
 	elif governed:
 		ok(m.complete > 0.0 and m.holes == 0, "%s: landed with no holes" % label)
+	if governed and g.soft and (cfg.conc == 1 or cfg.budget < 1.0):
+		ok(m.min_frac >= 0.5, "%s: mid-flight speed never below 50%% of cruise (%.2f)" % [label, m.min_frac])
+		ok(g.clamp_hits == 0, "%s: the failsafe clamp never engaged (%d)" % [label, g.clamp_hits])
 	else:
 		ok(m.arrive > 0.0, "%s: reported (holes %d of %d frames)" % [label, m.holes, m.ticks])
 	if cfg.csv:
