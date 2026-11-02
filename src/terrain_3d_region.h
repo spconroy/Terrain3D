@@ -61,6 +61,7 @@ private:
 	bool _deleted = false; // Marked for deletion on save
 	bool _edited = false; // Marked for undo/redo storage
 	bool _modified = false; // Marked for saving
+	bool _read_only = false; // Shared or reused data. Never written to disk
 	Vector2i _location = V2I_MAX;
 	CompressMode _last_color_compression = COMPRESS_NONE;
 
@@ -117,6 +118,9 @@ public:
 	bool is_edited() const { return _edited; }
 	void set_modified(const bool p_modified) { _modified = p_modified; }
 	bool is_modified() const { return _modified; }
+	void set_read_only(const bool p_read_only) { _read_only = p_read_only; }
+	bool is_read_only() const { return _read_only; }
+	void transform_maps(const int p_rotation, const bool p_mirror);
 	void set_location(const Vector2i &p_location);
 	Vector2i get_location() const { return _location; }
 

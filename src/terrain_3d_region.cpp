@@ -354,6 +354,28 @@ void Terrain3DRegion::set_location(const Vector2i &p_location) {
 	LOG(INFO, "Set location: ", p_location);
 }
 
+// Mirrors (flip x) then rotates clockwise by p_rotation quarter turns: height, control
+// and color. Pixels move whole, so the bit packed control map stays exact. Min/max
+// height are unchanged by either operation.
+void Terrain3DRegion::transform_maps(const int p_rotation, const bool p_mirror) {
+	int turns = p_rotation & 3;
+	if (turns == 0 && !p_mirror) {
+		return;
+	}
+	for (const Ref<Image> &img : { _height_map, _control_map, _color_map }) {
+		if (img.is_null() || img->is_empty()) {
+			continue;
+		}
+		if (p_mirror) {
+			img->flip_x();
+		}
+		for (int i = 0; i < turns; i++) {
+			img->rotate_90(CLOCKWISE);
+		}
+	}
+	_compressed_color_map.unref();
+}
+
 Error Terrain3DRegion::save(const String &p_path, const bool p_16_bit, const CompressMode p_color_compress_mode) {
 	// Initiate save to external file. The scene will save itself.
 	if (_location.x == INT32_MAX) {
@@ -362,6 +384,10 @@ Error Terrain3DRegion::save(const String &p_path, const bool p_16_bit, const Com
 	if (p_path.is_empty() && get_path().is_empty()) {
 		LOG(ERROR, "No valid path provided");
 		return ERR_FILE_NOT_FOUND;
+	}
+	if (_read_only) {
+		LOG(WARN, "Region ", _location, " is read only (reused file). Not saving");
+		return ERR_UNAUTHORIZED;
 	}
 	if (!p_path.is_empty()) {
 		LOG(DEBUG, "Setting file path for region ", _location, " to ", p_path);
@@ -533,6 +559,8 @@ void Terrain3DRegion::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_edited"), &Terrain3DRegion::is_edited);
 	ClassDB::bind_method(D_METHOD("set_modified", "modified"), &Terrain3DRegion::set_modified);
 	ClassDB::bind_method(D_METHOD("is_modified"), &Terrain3DRegion::is_modified);
+	ClassDB::bind_method(D_METHOD("set_read_only", "read_only"), &Terrain3DRegion::set_read_only);
+	ClassDB::bind_method(D_METHOD("is_read_only"), &Terrain3DRegion::is_read_only);
 	ClassDB::bind_method(D_METHOD("set_location", "location"), &Terrain3DRegion::set_location);
 	ClassDB::bind_method(D_METHOD("get_location"), &Terrain3DRegion::get_location);
 
