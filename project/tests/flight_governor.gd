@@ -27,8 +27,15 @@ extends RefCounted
 ## terrain.collision_mode = Terrain3DCollision.DISABLED at take-off and restore it at landing; set it after
 ## add_child (before it the mode is ignored).
 
-## Upper clamp on the speed (m/s), not a target. Short hops never reach it.
+## Upper clamp on the speed (m/s), not a target. Short hops never reach it. With auto_cap, setup() sets it from the
+## flight distance: cap_low up to cap_d_low, rising linearly to cap_high at cap_d_high (2.5 km/s up to 12 km, 3.5 km/s
+## at 28 km), so a 10 km flight keeps its ~5 s and a 28 km flight is not twice as long. Scale the blur to speed / max_speed.
 var max_speed := 2500.0
+var auto_cap := true
+var cap_low := 2500.0
+var cap_high := 3500.0
+var cap_d_low := 12000.0
+var cap_d_high := 28000.0
 var max_accel := 4000.0 ## m/s^2
 var max_jerk := 12000.0 ## m/s^3
 ## Share of max_accel the governor plans a stop inside the loaded terrain with, the rest is reserve.
@@ -41,6 +48,29 @@ var safety := 600.0
 var ready_tau := 0.4
 ## Time constant (s) with which a braking target is followed.
 var brake_tau := 0.15
+## SOFT GOVERNOR (v2). When the loader falls behind the camera does not wait for the braking distance clamp and nearly
+## stop: the target speed is min(cap, 0.88 x the loader's sustainable rate, rate + k x (ready - desired margin)), changed
+## with a fraction of the normal deceleration and jerk, after the sharp footprint was degraded (quality) before slowing.
+## The braking distance clamp stays underneath as the hole free failsafe. Turn off for the v1 behaviour.
+var soft := true
+var soft_k := 0.8 ## 1/s: speed change per meter of ready distance above or below the desired margin
+var soft_decel_fraction := 0.35 ## of max_accel while adapting
+var soft_jerk_fraction := 0.3 ## of max_jerk while adapting
+var cruise_fraction := 0.88 ## cruise speed as a share of the measured sustainable rate
+var floor_fraction := 0.3 ## the soft law never asks for less than this share of the cap
+var margin_look := 0.8 ## s of travel kept as a buffer on top of safety and the stopping distance
+var rate_tau := 2.0 ## s, time constant of a rise of the sustainable rate estimate (low bandwidth)
+var rate_tau_down := 0.7 ## s, time constant of a fall (a loader that slows is believed sooner than one that speeds up)
+var rate_window := 0.5 ## s, length of one throughput sample
+var stretch_until := 1.75 ## s: while no estimate exists yet, accelerate with stretch_accel x max_accel until here
+var stretch_accel := 0.6
+## Sharp footprint quality, 1 = full. It falls (quality_rate per s) while the loader limits the speed and recovers at
+## half that; the caller scales the corridor radius, cone width and margins with it. The governor scales safety by
+## lerp(far_min_fraction, 1, quality).
+var quality := 1.0
+var quality_min := 0.45
+var quality_rate := 0.35
+var far_min_fraction := 0.6
 ## Comfort limits of the climb and descent. The ramp distances are stretched until the planned altitude
 ## stays inside them at max_speed.
 var vert_max_accel := 3000.0
@@ -71,6 +101,19 @@ var ready_filtered := INF
 var clamp_hits := 0 ## Steps where the hard clamp had to hold the camera back (should stay 0)
 var min_ready_margin := INF ## Smallest (ready distance - travel - safety) over the steps that were limited by loading
 var plan_clearance := INF ## Smallest planned altitude above the terrain samples, from setup()
+var rate_est := 0.0 ## Sustainable path rate estimate (m/s), valid once rate_valid
+var rate_valid := false
+var rate_samples := 0
+var elapsed := 0.0
+var adapting := false ## The soft law is limiting the speed this step
+var soft_speed := INF ## The soft target this step
+var safety_full := -1.0
+var _win_t := 0.0
+var _win_sat := 0.0
+var _win_loads := -1
+var _observed := false
+var _unsat_time := 0.0
+var _limit_seen := false
 
 var start_altitude := 0.0
 var cruise_altitude := 0.0
@@ -79,6 +122,43 @@ var ramp_up := 0.0 ## Distance over which the climb eases in
 var ramp_down := 0.0 ## Distance over which the descent eases out
 var _pitch_vel := 0.0
 var _fov_vel := 0.0
+
+
+## The speed cap for a flight of this distance
+func cap_for_distance(d: float) -> float:
+	return lerpf(cap_low, cap_high, clampf((d - cap_d_low) / maxf(cap_d_high - cap_d_low, 1.0), 0.0, 1.0))
+
+
+## Blur strength and similar effects scale to this (0..1 of the cap for this flight)
+func speed_fraction() -> float:
+	return clampf(speed / max_speed, 0.0, 1.0)
+
+
+## Feed the loader's throughput: disk_loads_total is the running count of threaded loads consumed for regions needed now
+## (Terrain3DStreamer.get_stats().disk_loads_needed: not RAM cache insertions, not prefetch ahead of the path),
+## saturated says the load queue was full (inflight >= concurrent_loads, so the rate is what the loader can do and not
+## what was asked), metres_per_load is the path length one load advances the front (region size / regions per column).
+## Call every physics frame before step().
+func observe_loader(delta: float, disk_loads_total: int, saturated: bool, metres_per_load: float) -> void:
+	_observed = true
+	if _win_loads < 0:
+		_win_loads = disk_loads_total
+	_win_t += delta
+	_win_sat += delta if saturated else 0.0
+	if _win_t < rate_window:
+		return
+	var r := float(disk_loads_total - _win_loads) / _win_t * metres_per_load
+	var a := 1.0 - exp(-_win_t / (rate_tau if r > rate_est else rate_tau_down))
+	if _win_sat >= 0.9 * _win_t:
+		rate_est = r if not rate_valid else lerpf(rate_est, r, a)
+		rate_valid = true
+		rate_samples += 1
+	elif rate_valid and r > rate_est:
+		rate_est = lerpf(rate_est, r, a) # Not saturated: the loader can do at least this
+	_unsat_time = 0.0 if _win_sat >= 0.9 * _win_t else _unsat_time + _win_t
+	_win_t = 0.0
+	_win_sat = 0.0
+	_win_loads = disk_loads_total
 
 
 ## Distance in which a jerk limited stop from v completes
@@ -121,6 +201,20 @@ static func track(v: float, a: float, v_target: float, a_max: float, j_max: floa
 ## that does not depend on the loaded regions, e.g. the world wide low resolution map).
 func setup(path_length: float, heights: PackedFloat32Array, sample_step: float, ground_start: float, ground_end: float) -> void:
 	length = path_length
+	if auto_cap:
+		max_speed = cap_for_distance(path_length)
+	rate_est = 0.0
+	rate_valid = false
+	rate_samples = 0
+	elapsed = 0.0
+	quality = 1.0
+	_win_t = 0.0
+	_win_sat = 0.0
+	_win_loads = -1
+	_observed = false
+	_unsat_time = 0.0
+	_limit_seen = false
+	safety_full = -1.0
 	distance = 0.0
 	speed = 0.0
 	accel = 0.0
@@ -205,8 +299,31 @@ func target_speed(p_advance: float = 0.0) -> float:
 	return v
 
 
+## The smooth loader limited target: settles where the speed equals the loader's sustainable rate and the
+## ready distance equals the desired margin (safety + stopping distance + a short buffer).
+func soft_target() -> float:
+	if not soft:
+		return INF
+	# Once the loader has limited the flight the speed is held at a share of its rate, also when everything ahead
+	# is loaded, so the flight is one smooth profile and does not speed up at the end
+	var hold := INF
+	if rate_valid and _limit_seen:
+		hold = clampf(cruise_fraction * rate_est, floor_fraction * max_speed, max_speed)
+	if is_inf(ready_filtered):
+		return hold
+	var margin := safety + stop_distance(speed, max_accel * brake_fraction, max_jerk) + speed * margin_look
+	var rate_ref := rate_est * 0.95 if rate_valid else speed
+	var v := rate_ref + soft_k * (ready_filtered - margin)
+	return minf(clampf(v, floor_fraction * max_speed, max_speed), hold)
+
+
 func step(delta: float, ready_distance: float = INF) -> void:
 	var dt := maxf(delta, 1e-4)
+	elapsed += dt
+	if safety_full < 0.0:
+		safety_full = safety
+	if soft:
+		safety = safety_full * lerpf(far_min_fraction, 1.0, quality)
 	var remaining := length - distance
 	# Filtered ready distance: what was ready minus what was flown, rising smoothly, dropping at once. A
 	# path that is ready to its end limits nothing.
@@ -222,8 +339,25 @@ func step(delta: float, ready_distance: float = INF) -> void:
 		else:
 			ready_filtered = predicted + (ready_distance - predicted) * (1.0 - exp(-dt / ready_tau))
 	var a_prev := accel
-	var v_target := target_speed()
-	if v_target < max_speed - 1.0:
+	var v_hard := target_speed()
+	var v_soft := soft_target()
+	soft_speed = v_soft
+	var v_target := minf(v_hard, v_soft)
+	adapting = soft and v_soft < v_hard and v_soft < max_speed * 0.995
+	_limit_seen = _limit_seen or (adapting and rate_valid)
+	if soft and rate_valid and limited and _unsat_time >= 0.5:
+		# The queue is not full although regions are missing: the loader is not the limit, probe upwards slowly
+		rate_est = minf(rate_est * (1.0 + 0.25 * dt), max_speed / cruise_fraction)
+	if soft:
+		if adapting and rate_valid:
+			quality = maxf(quality - quality_rate * dt, quality_min) # Shrink the sharp footprint before slowing further
+		elif v_soft >= max_speed * 0.995 or not rate_valid:
+			quality = minf(quality + quality_rate * 0.5 * dt, 1.0)
+	if adapting:
+		# Smooth loader limited speed: a fraction of the normal deceleration and jerk, no braking curve
+		var a_lim := max_accel * soft_decel_fraction if v_target < speed else max_accel
+		accel = track(speed, accel, v_target, a_lim, max_jerk * soft_jerk_fraction, dt)
+	elif v_target < max_speed - 1.0:
 		# A braking constraint is active. Its target falls along the stopping curve as the camera
 		# approaches, so follow it with its rate of change fed forward (a plain error law would trail it
 		# and brake too late), still jerk limited.
@@ -231,7 +365,8 @@ func step(delta: float, ready_distance: float = INF) -> void:
 		var a_cmd := clampf(a_ff + (v_target - speed) / brake_tau, -max_accel, max_accel)
 		accel = a_prev + clampf((a_cmd - a_prev) / dt, -max_jerk, max_jerk) * dt
 	else:
-		accel = track(speed, accel, v_target, max_accel, max_jerk, dt)
+		var a_up := max_accel * stretch_accel if (soft and _observed and not rate_valid and elapsed < stretch_until and speed < 0.7 * max_speed) else max_accel
+		accel = track(speed, accel, v_target, a_up, max_jerk, dt)
 	var v_new := maxf(speed + accel * dt, 0.0)
 	var ds := (speed + v_new) * 0.5 * dt
 	# Failsafe: never move into the last `safety` meters in front of the camera's loaded terrain

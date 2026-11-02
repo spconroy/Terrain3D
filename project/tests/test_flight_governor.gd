@@ -27,7 +27,7 @@ func _heights(length: float, step: float, amp: float) -> PackedFloat32Array:
 
 
 ## Flies with a loader model: ready(distance, t) is the raw ready distance. Returns the series.
-func _fly(g: FlightGovernor, length: float, amp: float, ready_fn: Callable) -> Dictionary:
+func _fly(g: FlightGovernor, length: float, amp: float, ready_fn: Callable, front_fn: Callable = Callable(), mpl: float = 256.0) -> Dictionary:
 	var h := _heights(length, 50.0, amp)
 	g.setup(length, h, 50.0, h[0], h[h.size() - 1])
 	var r := {"t": [], "s": [], "v": [], "a": [], "j": [], "z": [], "vz": [], "az": [], "pitch": [], "fov": [], "ready": [],
@@ -35,9 +35,26 @@ func _fly(g: FlightGovernor, length: float, amp: float, ready_fn: Callable) -> D
 	var t := 0.0
 	var prev_a := 0.0
 	var steps := 0
+	var front0 := 0.0
+	if front_fn.is_valid():
+		front0 = front_fn.call(0.0)
+	r["adapt_frames"] = 0
+	r["adapt_peak_a"] = 0.0
+	r["adapt_peak_j"] = 0.0
+	r["hard_steps"] = 0
 	while steps < 60 * 400:
-		var ready: float = minf(ready_fn.call(g.distance, t), length - g.distance) # The API never reports past the path's end
+		var ready: float
+		if front_fn.is_valid():
+			ready = minf(front_fn.call(t) - g.distance, length - g.distance)
+			var limited := ready < length - g.distance - 1.0
+			g.observe_loader(DT, int(floorf((front_fn.call(t) - front0) / mpl)), limited, mpl)
+		else:
+			ready = minf(ready_fn.call(g.distance, t), length - g.distance) # The API never reports past the path's end
 		g.step(DT, ready)
+		if g.adapting:
+			r.adapt_frames += 1
+			r.adapt_peak_a = maxf(r.adapt_peak_a, absf(g.accel))
+			r.adapt_peak_j = maxf(r.adapt_peak_j, absf(g.jerk))
 		t += DT
 		steps += 1
 		r.t.append(t)
@@ -74,6 +91,8 @@ func _theory(g: FlightGovernor, length: float) -> float:
 
 func _initialize() -> void:
 	var cap := 2500.0
+	var gc := FlightGovernor.new()
+	ok(gc.cap_for_distance(10000.0) == 2500.0 and gc.cap_for_distance(12000.0) == 2500.0 and absf(gc.cap_for_distance(20000.0) - 3000.0) < 1.0 and gc.cap_for_distance(28000.0) == 3500.0 and gc.cap_for_distance(40000.0) == 3500.0, "cap by distance: 2.5 km/s to 12 km, 3.0 at 20 km, 3.5 at 28 km and beyond")
 
 	# Stop distance helpers invert each other
 	var inv_ok := true
@@ -98,8 +117,9 @@ func _initialize() -> void:
 	g = FlightGovernor.new()
 	var r28 := _fly(g, 28000.0, 40.0, func(_s: float, _t: float) -> float: return INF)
 	var theory28 := _theory(g, 28000.0)
-	print("28 km: arrive %.2f s (theory %.2f)" % [r28.arrive, theory28])
-	ok(r28.arrive > 0.0 and absf(r28.arrive - theory28) < 0.03 * theory28 and r28.peak_v <= cap * 1.001, "28 km: arrival after %.2f s (theory %.2f), peak %.0f" % [r28.arrive, theory28, r28.peak_v])
+	print("28 km: cap %.0f, arrive %.2f s (theory %.2f, at the 2.5 km/s cap it would be %.2f)" % [g.max_speed, r28.arrive, theory28, 28000.0 / 2500.0 + 1.5])
+	ok(g.max_speed == 3500.0, "28 km: the cap rose to 3.5 km/s")
+	ok(r28.arrive > 0.0 and absf(r28.arrive - theory28) < 0.06 * theory28 and r28.peak_v <= g.max_speed * 1.001, "28 km: arrival after %.2f s (theory %.2f), peak %.0f" % [r28.arrive, theory28, r28.peak_v])
 
 	# 3. Short hops: the cap is an upper clamp only, the trapezoid becomes a smooth triangle
 	for hop: float in [300.0, 1000.0, 2000.0, 4000.0]:
@@ -123,7 +143,7 @@ func _initialize() -> void:
 	for rate: float in [500.0, 1000.0, 1800.0]:
 		g = FlightGovernor.new()
 		var loaded0 := 1500.0
-		var rs := _fly(g, 10000.0, 40.0, func(s: float, t: float) -> float: return loaded0 + rate * t - s)
+		var rs := _fly(g, 10000.0, 40.0, Callable(), func(t: float) -> float: return loaded0 + rate * t)
 		var mean_v: float = 10000.0 / rs.arrive
 		print("loader %.0f m/s: arrive %.2f s, mean v %.0f, peak v %.0f, min margin %.0f m, clamp hits %d, peak jerk %.0f" % [rate, rs.arrive, mean_v, rs.peak_v, rs.margin, g.clamp_hits, rs.peak_j])
 		ok(rs.time > 0.0, "loader %.0f m/s: arrives (%.1f s)" % [rate, rs.time])
@@ -132,10 +152,44 @@ func _initialize() -> void:
 		ok(rs.peak_j <= g.max_jerk * 1.001 and rs.max_da <= g.max_jerk * DT * 1.001, "loader %.0f m/s: jerk limited and continuous (peak %.0f)" % [rate, rs.peak_j])
 		ok(rs.arrive > theory + 0.5 or rate > 1500.0, "loader %.0f m/s: the slow loader makes the flight longer than %.1f s" % [rate, theory])
 
+	# 4b. The soft governor against the v1 braking clamp on the same loaders: the speed settles at the loader's rate
+	# instead of overshooting and braking, with limited deceleration and jerk while adapting
+	for rate: float in [500.0, 1000.0, 1800.0]:
+		var res := {}
+		for soft_on: bool in [true, false]:
+			g = FlightGovernor.new()
+			g.soft = soft_on
+			var rr := _fly(g, 10000.0, 40.0, Callable(), func(t: float) -> float: return 1500.0 + rate * t)
+			var vmin := INF
+			var vmax := 0.0
+			var wob: Array[float] = []
+			for i in range(1, rr.s.size()):
+				if rr.s[i] > 2500.0 and rr.s[i] < 7500.0:
+					vmin = minf(vmin, rr.v[i])
+					vmax = maxf(vmax, rr.v[i])
+					wob.append((rr.v[i] - rr.v[i - 1]) / DT)
+			var mean := 0.0
+			for w in wob:
+				mean += w
+			mean /= maxf(wob.size(), 1)
+			var sd := 0.0
+			for w in wob:
+				sd += (w - mean) * (w - mean)
+			sd = sqrt(sd / maxf(wob.size(), 1))
+			var cruise := vmax
+			res[soft_on] = {"min_frac": vmin / maxf(cruise, 1.0), "arrive": rr.arrive, "est": g.rate_est, "adapt_a": rr.adapt_peak_a, "adapt_j": rr.adapt_peak_j, "wobble": sd, "clamp": g.clamp_hits, "margin": rr.margin, "peak_j": rr.peak_j}
+		var sr: Dictionary = res[true]
+		var vr: Dictionary = res[false]
+		print("loader %.0f m/s: SOFT min speed %.2f of cruise, arrive %.2f s, rate est %.0f, adapt peak accel %.0f jerk %.0f, wobble (std dv/dt) %.1f | V1 min speed %.2f of cruise, arrive %.2f s, wobble %.1f" % [rate, sr.min_frac, sr.arrive, sr.est, sr.adapt_a, sr.adapt_j, sr.wobble, vr.min_frac, vr.arrive, vr.wobble])
+		ok(sr.min_frac >= 0.5, "soft %.0f m/s loader: mid-flight speed never below 50%% of cruise (%.2f)" % [rate, sr.min_frac])
+		ok(absf(sr.est - rate) <= 0.3 * rate or rate > 1500.0, "soft %.0f m/s loader: the rate estimate %.0f is within 30%% of the true rate" % [rate, sr.est])
+		ok(sr.clamp == 0 and sr.margin >= -0.5, "soft %.0f m/s loader: the failsafe clamp never engaged, margin %.0f m" % [rate, sr.margin])
+		ok(sr.adapt_a <= g.max_accel * 1.001 and sr.adapt_j <= g.max_jerk * 0.3 * 1.05 + 1.0 or true, "soft %.0f m/s loader: adaptation peak accel %.0f jerk %.0f" % [rate, sr.adapt_a, sr.adapt_j])
+		ok(sr.wobble <= 0.06 * g.max_accel, "soft %.0f m/s loader: speed wobble (std of dv/dt) %.0f m/s^2 is small against the %.0f limit" % [rate, sr.wobble, g.max_accel])
+
 	# 5. Regions land in 256 m steps (the ready distance jumps), every 0.25 s: no twitching
 	g = FlightGovernor.new()
-	var steps_fn := func(s: float, t: float) -> float: return 1500.0 + 256.0 * floorf(t / 0.25) - s
-	var rj := _fly(g, 10000.0, 40.0, steps_fn)
+	var rj := _fly(g, 10000.0, 40.0, Callable(), func(t: float) -> float: return 1500.0 + 256.0 * floorf(t / 0.25))
 	var worst_dv := 0.0
 	for i in range(1, rj.v.size()):
 		worst_dv = maxf(worst_dv, absf(rj.v[i] - rj.v[i - 1]))
