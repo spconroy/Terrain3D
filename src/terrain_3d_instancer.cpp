@@ -1,6 +1,7 @@
 // Copyright © 2023-2026 Cory Petkovsek, Roope Palmroos, and Contributors.
 
 #include <godot_cpp/classes/resource_saver.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/classes/world3d.hpp>
 
 #include "constants.h"
@@ -90,20 +91,34 @@ void Terrain3DInstancer::_process_updates() {
 		}
 	}
 	LOG(DEBUG, "Processing ", (int)to_process.size(), " queued updates");
+	// While streaming, regions arrive continuously: stop at the frame budget and leave the
+	// rest queued for the next frame, so one new region's instances don't land in a single frame
+	bool streaming = _terrain->is_streaming_active();
+	uint64_t budget_us = streaming ? uint64_t(_terrain->get_streaming_frame_budget_ms() * 1000.f) : 0;
+	uint64_t start_us = Time::get_singleton()->get_ticks_usec();
+	bool built = false;
+	V2IIntPair deferred;
 	for (const Pair<Vector2i, int> &update : to_process) {
 		const Vector2i &region_loc = update.first;
 		int mesh_id = update.second;
+		if (built && budget_us > 0 && Time::get_singleton()->get_ticks_usec() - start_us >= budget_us) {
+			deferred.insert(update);
+			continue;
+		}
 		const Terrain3DRegion *region = data->get_region_ptr(region_loc);
 		if (!region) {
-			LOG(WARN, "Errant null region found at: ", region_loc);
+			if (!streaming) { // Evicted before it was built, nothing to do
+				LOG(WARN, "Errant null region found at: ", region_loc);
+			}
 			continue;
 		}
 		if (!region->get_instances().has(mesh_id)) {
 			continue;
 		}
 		_update_mmi_by_region(region, mesh_id);
+		built = true;
 	}
-	_queued_updates.clear();
+	_queued_updates = deferred;
 	_terrain->get_assets()->load_pending_meshes();
 }
 

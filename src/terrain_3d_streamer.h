@@ -13,6 +13,7 @@
 using namespace godot;
 
 class Terrain3D;
+class Terrain3DData;
 
 // Runtime region streaming. Loads regions around the clipmap target on background
 // threads and evicts them as the target moves away, so memory scales with the
@@ -48,6 +49,15 @@ private:
 	int _concurrent_loads = 3; // Threaded region loads in flight
 	int _loads_per_frame = 1; // Loaded regions inserted per physics frame
 	bool _persist_edits = false; // Write a modified region back to disk when it is evicted
+	real_t _frame_budget_ms = 2.f; // Main thread time for insertions and evictions per physics frame, 0 = loads_per_frame
+
+	// A region whose texture layers are being uploaded over several frames
+	struct Staged {
+		Ref<Terrain3DRegion> region;
+		int slot = -1;
+		int step = 0; // Maps uploaded so far; the next step commits
+		real_t ms = 0.f; // Main thread time spent on it
+	};
 
 	// Work data
 	Vector<Vector2i> _known; // Region locations present on disk
@@ -55,6 +65,8 @@ private:
 	HashMap<Vector2i, uint64_t> _failed; // Failed loads, location -> msec time it may be requested again
 	HashMap<Vector2i, int> _fail_count; // Failures per location, a location is given up on after FAIL_RETRIES
 	HashMap<Vector2i, String> _pending; // In flight threaded loads, location -> path
+	Vector<Staged> _staged; // Reserved regions being uploaded, oldest first
+	HashSet<Vector2i> _staged_set;
 	HashMap<Vector2i, Ref<Terrain3DRegion>> _ram_cache; // RAM mode: evicted bodies, plus prefetched ones
 	int _prefetch_cursor = 0; // RAM mode: background walk of _known filling the cache
 	Vector2 _travel_dir; // Moving average of target motion, breaks load order ties
@@ -67,6 +79,11 @@ private:
 	real_t _distance_to(const Vector2i &p_region_loc, const Vector2i &p_focus_loc) const;
 	void _apply_distance_limit();
 	void _collision_refresh(const Vector2i &p_region_loc);
+	bool _budget_spent(const uint64_t p_start_us) const;
+	bool _can_insert(const int p_inserted, const bool p_worked, const uint64_t p_start_us) const;
+	void _land(const Vector2i &p_region_loc, const real_t p_ms);
+	bool _insert(Terrain3DData *p_data, const Ref<Terrain3DRegion> &p_region, const uint64_t p_start_us, bool &r_worked);
+	void _advance_staged(Terrain3DData *p_data, const uint64_t p_start_us, bool &r_worked);
 	void _flush_ram_cache();
 	void _mark_failed(const Vector2i &p_region_loc, const bool p_give_up = false);
 	bool _is_failed(const Vector2i &p_region_loc) const;
@@ -95,6 +112,8 @@ public:
 	int get_loads_per_frame() const { return _loads_per_frame; }
 	void set_persist_edits(const bool p_enabled) { _persist_edits = p_enabled; }
 	bool get_persist_edits() const { return _persist_edits; }
+	void set_frame_budget_ms(const real_t p_ms) { _frame_budget_ms = CLAMP(p_ms, 0.f, 50.f); }
+	real_t get_frame_budget_ms() const { return _frame_budget_ms; }
 
 	void scan_directory();
 	void step();

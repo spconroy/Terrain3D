@@ -429,8 +429,12 @@
 			Enables region streaming at runtime. Instead of loading every region in [member data_directory] up front, regions within [member streaming_distance] of the clipmap target are loaded on background threads and evicted as the target moves away, so memory scales with the loaded area instead of the whole terrain. Streaming is a read-only view of [member data_directory]: edits made to a loaded region at runtime are dropped when it is evicted unless [member streaming_persist_edits] is on. Has no effect inside the editor, which always keeps the full terrain loaded and saves every region as usual, so the other [code skip-lint]streaming_[/code] properties only take effect in the game; see [method is_streaming_active].
 			Alias for [member Terrain3DStreamer.enabled].
 		</member>
+		<member name="streaming_frame_budget_ms" type="float" setter="set_streaming_frame_budget_ms" getter="get_streaming_frame_budget_ms" default="2.0">
+			Main thread time, in milliseconds, that region insertions and evictions may take per physics frame. Large regions are uploaded, and their instances built, in steps spread over a few frames instead of one long one; 0 inserts whole regions, limited by [member streaming_loads_per_frame]. See [member Terrain3DStreamer.frame_budget_ms].
+			Alias for [member Terrain3DStreamer.frame_budget_ms].
+		</member>
 		<member name="streaming_loads_per_frame" type="int" setter="set_streaming_loads_per_frame" getter="get_streaming_loads_per_frame" default="1">
-			How many completed region loads may be inserted into the terrain per physics frame. Each insertion uploads texture layers and updates collision on the main thread, so raising this trades hitching for faster fill in.
+			How many completed region loads may be inserted into the terrain per physics frame. Each insertion uploads texture layers and updates collision on the main thread, so raising this trades hitching for faster fill in. Only used when [member streaming_frame_budget_ms] is 0.
 			Alias for [member Terrain3DStreamer.loads_per_frame].
 		</member>
 		<member name="streaming_mode" type="int" setter="set_streaming_mode" getter="get_streaming_mode" enum="Terrain3DStreamer.StreamMode" default="0">

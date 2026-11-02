@@ -31,7 +31,7 @@
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns live streaming counters: [code skip-lint]streaming_active[/code], [code skip-lint]resident[/code], [code skip-lint]free_slots[/code], [code skip-lint]inflight[/code], [code skip-lint]failed[/code] (locations whose load failed; each is requested again every few seconds, then ignored after three failures until [method scan_directory]), [code skip-lint]known[/code], [code skip-lint]landed_total[/code], [code skip-lint]evicted_total[/code], and [code skip-lint]land_ms_avg[/code] (an exponential moving average of an insertion's main thread cost in ms). Useful for debug overlays and tests.
+				Returns live streaming counters: [code skip-lint]streaming_active[/code], [code skip-lint]resident[/code], [code skip-lint]free_slots[/code], [code skip-lint]inflight[/code], [code skip-lint]staged[/code] (regions partway through a budgeted insertion), [code skip-lint]failed[/code] (locations whose load failed; each is requested again every few seconds, then ignored after three failures until [method scan_directory]), [code skip-lint]known[/code], [code skip-lint]landed_total[/code], [code skip-lint]evicted_total[/code], and [code skip-lint]land_ms_avg[/code] (an exponential moving average of an insertion's main thread cost in ms). Useful for debug overlays and tests.
 			</description>
 		</method>
 		<method name="is_active" qualifiers="const">
@@ -64,12 +64,18 @@
 		<member name="enabled" type="bool" setter="set_enabled" getter="is_enabled" default="false">
 			Enables region streaming at runtime. Instead of loading every region up front, regions within [member distance] of the clipmap target are loaded on background threads and evicted as the target moves away. Streaming is a read-only view of the data directory: eviction drops a region together with any runtime edits unless [member persist_edits] is on. Has no effect inside the editor; see [method is_active].
 		</member>
+		<member name="frame_budget_ms" type="float" setter="set_frame_budget_ms" getter="get_frame_budget_ms" default="2.0">
+			Main thread time, in milliseconds, that region insertions and evictions may take per physics frame. Uploading a region's texture layers is the main cost of streaming and grows with [member Terrain3D.region_size], so an insertion is split into steps (height map, control map, color map, then making the region visible). Steps run until the budget is spent, and at least one runs every frame, so the cost of a frame is about the budget plus one step instead of the whole region. Small regions complete several per frame; large regions are spread over a few frames.
+			A region becomes visible only after all of its steps are done. The same budget spreads building the region's [Terrain3DInstancer] instances over frames, one mesh asset at a time.
+			Lower values keep frame times steadier but fill the loaded area more slowly. Raise it, or set it to 0 (each region is then inserted at once, up to [member loads_per_frame] per frame), while a loading screen hides the hitch, for example after a teleport.
+			Alias target of [member Terrain3D.streaming_frame_budget_ms].
+		</member>
 		<member name="mode" type="int" setter="set_mode" getter="get_mode" enum="Terrain3DStreamer.StreamMode" default="0">
 			What eviction does with a region's data. DISK drops the region; RAM keeps every body cached in memory (and prefetches the rest of the world in the background with spare load budget), so only the GPU layers follow the loaded area and revisits never touch the disk. RAM mode trades memory for the smoothest possible region changes. In either mode a region's edits are written back only when [member persist_edits] is on.
 			Alias target of [member Terrain3D.streaming_mode].
 		</member>
 		<member name="loads_per_frame" type="int" setter="set_loads_per_frame" getter="get_loads_per_frame" default="1">
-			How many completed region loads may be inserted into the terrain per physics frame. Each insertion uploads texture layers and updates collision on the main thread, so raising this trades hitching for faster fill in.
+			How many completed region loads may be inserted into the terrain per physics frame. Each insertion uploads texture layers and updates collision on the main thread, so raising this trades hitching for faster fill in. Only used when [member frame_budget_ms] is 0, which replaces it with a time budget.
 		</member>
 		<member name="persist_edits" type="bool" setter="set_persist_edits" getter="get_persist_edits" default="false">
 			Whether a region modified at runtime is written back to the data directory when it is evicted (and, in RAM mode, when the cache is flushed by leaving RAM mode or disabling streaming). Off by default: streaming is a read-only view of the data on disk, so eviction drops the region together with its runtime edits and a revisit reloads the on-disk version. In RAM mode the edits survive eviction in the cache until it is flushed. Turn it on for a world that should persist runtime edits; otherwise save explicitly with [method Terrain3DData.save_directory]. Note that persisting can overwrite an edit made to the same region file by another process while the region was resident.
