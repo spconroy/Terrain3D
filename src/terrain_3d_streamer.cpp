@@ -271,20 +271,29 @@ void Terrain3DStreamer::step() {
 		} else if (_axis.y < -bias) {
 			target.y = floc.y + retained - window + 1;
 		}
-		if (!escaped) {
-			// Move only when it brings regions needed now inside the window
-			int outside_now = 0;
-			int outside_after = 0;
+		// Pick the position of the window that leaves the fewest regions needed now outside it: the one
+		// reaching ahead, the one centred on the target (what a destination around the target needs once
+		// it stops), or where it is. Move only when that is an improvement...
+		auto outside_of = [&](const Vector2i &p_origin) {
+			int n = 0;
 			for (int i = 0; i < _wanted_near.size(); i++) {
 				const Vector2i &w = _wanted_near[i];
-				outside_now += (w.x < origin.x || w.y < origin.y || w.x >= origin.x + window || w.y >= origin.y + window) ? 1 : 0;
-				outside_after += (w.x < target.x || w.y < target.y || w.x >= target.x + window || w.y >= target.y + window) ? 1 : 0;
+				n += (w.x < p_origin.x || w.y < p_origin.y || w.x >= p_origin.x + window || w.y >= p_origin.y + window) ? 1 : 0;
 			}
-			// ...and in jumps of a few regions, so a fast flight does not rewrite the map every region it crosses
-			const Vector2i shift = target - origin;
-			if (outside_now == 0 || outside_after >= outside_now || (ABS(shift.x) < WINDOW_SLIDE_MIN && ABS(shift.y) < WINDOW_SLIDE_MIN)) {
-				target = origin;
-			}
+			return n;
+		};
+		const Vector2i centred = floc - V2I(window / 2);
+		const int outside_now = outside_of(origin);
+		const int outside_ahead = outside_of(target);
+		const int outside_centred = outside_of(centred);
+		if (outside_centred < outside_ahead) {
+			target = centred;
+		}
+		const int outside_after = MIN(outside_ahead, outside_centred);
+		// ...and in jumps of a few regions, so a fast flight does not rewrite the map every region it crosses
+		const Vector2i shift = target - origin;
+		if (!escaped && (outside_now == 0 || outside_after >= outside_now || (ABS(shift.x) < WINDOW_SLIDE_MIN && ABS(shift.y) < WINDOW_SLIDE_MIN))) {
+			target = origin;
 		}
 	}
 	if (target != origin && (escaped || _has_axis)) {
