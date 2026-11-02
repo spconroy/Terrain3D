@@ -490,6 +490,7 @@ void Terrain3DStreamer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_max_distance"), &Terrain3DStreamer::get_max_distance);
 	ClassDB::bind_method(D_METHOD("scan_directory"), &Terrain3DStreamer::scan_directory);
 	ClassDB::bind_method(D_METHOD("abort_pending"), &Terrain3DStreamer::abort_pending);
+	ClassDB::bind_method(D_METHOD("step"), &Terrain3DStreamer::step);
 	ClassDB::bind_method(D_METHOD("get_stats"), &Terrain3DStreamer::get_stats);
 
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "enabled"), "set_enabled", "is_enabled");
