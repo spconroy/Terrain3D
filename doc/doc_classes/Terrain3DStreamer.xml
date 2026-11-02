@@ -5,7 +5,8 @@
 	<description>
 		This class manages runtime region streaming. Regions around the clipmap target are loaded on background threads and evicted as the target moves away, so memory scales with the loaded area instead of the whole terrain. It works with the slot pool in [Terrain3DData]; see [method Terrain3DData.enable_streaming].
 		The loaded area is a keep set: the union of the clipmap target's own area ([member distance], scaled by [member camera_scale]) and any shapes added with [method add_keep_circle], [method add_keep_path] and [method add_keep_cone]. Regions inside the keep set load, regions outside it evict, with one region of hysteresis around the shapes. With no shapes the keep set is the clipmap target's area alone, as before. Shapes are in world units on the XZ plane. A region is inside a circle or a path corridor when any part of its footprint is within the radius; a cone is a half ellipse ahead of its origin and a smaller one behind it, grown by half a region, so it keeps every region it overlaps.
-		Load order: destination shapes first, then paths in order of arrival (the part of the path ahead of the clipmap target, nearest first), then everything else nearest first. Only regions inside the region map window ([member Terrain3D.region_map_size]) can take a slot, and the window stays centred on the clipmap target. A shape beyond the window loads its region bodies into a RAM cache ([member keep_cache_limit]) and they insert as soon as the window reaches them. If the pool has fewer slots than the keep set needs, the regions nearest the clipmap target are kept and the rest are counted as [code skip-lint]deferred[/code] in [method get_stats].
+		Load order: regions behind the direction of travel last, then destination shapes, then paths in order of arrival (the part of the path ahead of the clipmap target, nearest first), then everything else nearest first. The direction of travel is the tangent of the first path at the clipmap target, else the direction of the first cone; without either nothing counts as behind. Only regions inside the region map window ([member Terrain3D.region_map_size]) can take a slot. The window recentres on the clipmap target when its retained area leaves it; along a path or cone it also slides ahead, keeping the retained area at the rear, as soon as regions needed now lie outside it, so the regions ahead take a slot with time to spare. A shape beyond the window, and a region the slot pool cannot hold yet, load their region bodies into a RAM cache ([member keep_cache_limit]) and they insert as soon as a slot is free and the window reaches them. If the pool has fewer slots than the keep set needs, the regions ahead of the direction of travel are kept first, the nearest first (a path by arrival), regions behind it last, and the rest are counted as [code skip-lint]deferred[/code] in [method get_stats].
+		For long camera flights see [method set_keep_path_ahead], [member behind_limit], [method get_path_ready_distance] and [method get_path_cost]. A flight keeps a path, a forward cone and (late) a destination circle, limits the path to a lookahead segment, sets [member behind_limit] to one region, and a game side governor limits the camera speed to what [method get_path_ready_distance] shows is visible. Preloading the destination only when time to arrival drops below the time it needs to load, and the rest of the corridor as cached bodies when memory allows, is up to the caller. Suspend dynamic collision during a long flight with [code skip-lint]collision_mode = Terrain3DCollision.DISABLED[/code] (set after the node is in the tree) and restore it at landing, or each landed region near the fast moving target triggers a collision refresh of about 25 ms.
 		When a shape shrinks (a smaller radius, length or width, a shorter path) or is removed, or [member camera_scale] decreases, the next step evicts every region outside the new keep set at once, saving edited regions through the same worker thread as any eviction if [member persist_edits] is on (the early eviction is not limited by [member frame_budget_ms]), and drops loads still in flight for them. That keep set becomes the hysteresis baseline. Callers that want a gradual release lower the size a little each frame. Moving or growing a shape evicts nothing early.
 		Settings are exposed as aliases on the [Terrain3D] node (e.g. [member Terrain3D.streaming_enabled]), which is also where they are saved. Streaming only runs outside the editor; the editor always keeps the full terrain loaded.
 	</description>
@@ -71,6 +72,35 @@
 				The largest [member distance] the current [member slots] capacity and the region map window can hold with the current [member shape].
 			</description>
 		</method>
+		<method name="get_cached_regions" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Returns the locations (Vector2i) whose region body waits in the RAM cache, for debug overlays and tests.
+			</description>
+		</method>
+		<method name="get_path_cost" qualifiers="const">
+			<return type="Dictionary" />
+			<param index="0" name="points" type="PackedVector3Array" />
+			<param index="1" name="radius" type="float" />
+			<description>
+				Estimates what a corridor of [param radius] world units around a polyline costs to hold, so a caller can compare it with a memory budget before prefetching it. Returns [code skip-lint]length[/code] (meters along the polyline), [code skip-lint]cells[/code] (regions the corridor touches), [code skip-lint]regions[/code] (those with a file), [code skip-lint]region_bytes[/code] (the raw size of one region body: region_size squared times 4 bytes for each of height, control and, if [member Terrain3D.color_map_enabled] is on, color), [code skip-lint]bytes[/code] (regions times region_bytes, the RAM cache cost of holding every body) and [code skip-lint]outside_window[/code] (regions beyond the region map window now, which can only be cached until the window reaches them).
+			</description>
+		</method>
+		<method name="get_path_ready_distance" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="id" type="int" />
+			<param index="1" name="from_distance" type="float" default="-1.0" />
+			<description>
+				Returns the meters along the path [param id], from the clipmap target's position on it (or from [param from_distance] meters along the path if it is not negative), to the first region the path corridor needs that is not visible yet, or to the end of the path if all are. Only regions inserted into the region map count: a body waiting in the RAM cache or partway through a budgeted insertion is not visible. Regions behind the starting point, without a file, or given up on after repeated failures are skipped. Returns -1 for an unknown id.
+				A game side camera governor uses it to never outrun the loaded terrain: the camera may only fly at a speed from which it can still stop inside the ready distance less a safety margin, [code skip-lint]speed_limit = sqrt(2 * brake * (ready_distance - safety))[/code], which gives [code skip-lint]ready_distance / lookahead_seconds[/code] at a steady flight. The distance is measured to the entry of the first missing region into the corridor, so a missing region is reported early by up to the corridor radius.
+			</description>
+		</method>
+		<method name="get_pending_regions" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Returns the locations (Vector2i) with a threaded load in flight, for debug overlays and tests that record the order of requests.
+			</description>
+		</method>
 		<method name="get_required_slots" qualifiers="const">
 			<return type="int" />
 			<param index="0" name="distance" type="int" />
@@ -78,10 +108,17 @@
 				How many pool slots the given distance needs with the current [member shape], including the one region hysteresis band. Square: (2 * (distance + 1) + 1)².
 			</description>
 		</method>
+		<method name="get_wanted_regions" qualifiers="const">
+			<return type="Array" />
+			<param index="0" name="cache_only" type="bool" default="false" />
+			<description>
+				Returns the locations (Vector2i) the last step wanted, which is what the streamer really uses: the regions needed now, or with [param cache_only] the regions that are only fetched as bodies into the RAM cache, ahead of the reach of a path (see [method set_keep_path_ahead]). A region is missing when it is wanted and [method Terrain3DData.has_region] is false. The [code skip-lint]wanted[/code] and [code skip-lint]missing[/code] stats count the first list only.
+			</description>
+		</method>
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns live streaming counters: [code skip-lint]streaming_active[/code], [code skip-lint]resident[/code], [code skip-lint]free_slots[/code], [code skip-lint]inflight[/code], [code skip-lint]staged[/code] (regions partway through a budgeted insertion), [code skip-lint]saving[/code] (evicted regions being written to disk), [code skip-lint]failed[/code] (locations whose load failed; each is requested again every few seconds, then ignored after three failures until [method scan_directory]), [code skip-lint]known[/code], [code skip-lint]landed_total[/code], [code skip-lint]evicted_total[/code], and [code skip-lint]land_ms_avg[/code] (an exponential moving average of an insertion's main thread cost in ms), and for the keep set [code skip-lint]keep_shapes[/code], [code skip-lint]wanted[/code] (known regions inside it), [code skip-lint]missing[/code] (wanted, inside the region map window, not resident yet), [code skip-lint]deferred[/code] (wanted but the slot pool cannot hold them) and [code skip-lint]outside_window[/code] (wanted but beyond the region map window, waiting in the RAM cache). Useful for debug overlays and tests.
+				Returns live streaming counters: [code skip-lint]streaming_active[/code], [code skip-lint]resident[/code], [code skip-lint]free_slots[/code], [code skip-lint]inflight[/code], [code skip-lint]staged[/code] (regions partway through a budgeted insertion), [code skip-lint]saving[/code] (evicted regions being written to disk), [code skip-lint]failed[/code] (locations whose load failed; each is requested again every few seconds, then ignored after three failures until [method scan_directory]), [code skip-lint]known[/code], [code skip-lint]landed_total[/code], [code skip-lint]evicted_total[/code], and [code skip-lint]land_ms_avg[/code] (an exponential moving average of an insertion's main thread cost in ms), and for the keep set [code skip-lint]keep_shapes[/code], [code skip-lint]wanted[/code] (known regions inside it), [code skip-lint]missing[/code] (wanted, inside the region map window, not resident yet), [code skip-lint]deferred[/code] (wanted but the slot pool cannot hold them) [code skip-lint]outside_window[/code] (wanted but beyond the region map window, waiting in the RAM cache), [code skip-lint]nearest_missing[/code] (meters from the clipmap target to the nearest wanted region that is not visible yet and not behind the direction of travel, -1 if none), [code skip-lint]recentres[/code] (region map window moves so far) and [code skip-lint]collision_refreshes[/code] (dynamic collision refreshes the streamer asked for). Useful for debug overlays and tests.
 			</description>
 		</method>
 		<method name="is_active" qualifiers="const">
@@ -131,6 +168,16 @@
 				Moves, turns or resizes a cone in place, e.g. every frame with the camera. Returns [code skip-lint]false[/code] if [param id] is not a cone. A zero [param direction] keeps the old one. A smaller length, half width or behind evicts early; see the class description.
 			</description>
 		</method>
+		<method name="set_keep_path_ahead">
+			<return type="bool" />
+			<param index="0" name="id" type="int" />
+			<param index="1" name="ahead" type="float" />
+			<param index="2" name="prefetch" type="float" default="0.0" />
+			<description>
+				Limits a path to the stretch the camera needs. Regions further than [param ahead] world units along the path from the clipmap target's position on it are not wanted: they take no slot, no load order and are not in the [code skip-lint]wanted[/code] and [code skip-lint]missing[/code] stats, so regions behind a moving camera release as it passes. A negative [param ahead] restores the whole path.
+				[param prefetch] reaches further, for region bodies only: the regions up to that many world units ahead (negative: to the end of the path) load into the RAM cache ([member keep_cache_limit]) without taking a slot, and insert when they become needed. They are requested after everything that is needed, and never use the last of [member concurrent_loads] while a needed region is waiting; a needed body that does not fit in the cache takes the place of the farthest prefetched one. A caller that knows the memory is there (see [method get_path_cost]) prefetches the whole corridor this way without delaying the near path. Returns [code skip-lint]false[/code] if [param id] is not a path.
+			</description>
+		</method>
 		<method name="set_keep_path">
 			<return type="bool" />
 			<param index="0" name="id" type="int" />
@@ -148,6 +195,9 @@
 		</method>
 	</methods>
 	<members>
+		<member name="behind_limit" type="float" setter="set_behind_limit" getter="get_behind_limit" default="-1.0">
+			Keeps nothing further than this many world units behind the clipmap target, against the direction of travel (see the class description). A region whose center is more than the limit plus half a region behind is neither loaded nor retained, whichever shape or area would keep it, with no hysteresis: with a limit of one region size, the region the target stands in, the next one ahead and the one behind it stay, and everything further behind unloads, through the worker thread (and its save if [member persist_edits] is on). Destination shapes are exempt. A negative value turns it off. Setting it, or lowering it, evicts at once. It needs a path or a cone to define the direction of travel. For a cone alone, [code skip-lint]behind = region_size[/code] and [member camera_scale] 0 hold one region behind the target; the limit is what trims a path.
+		</member>
 		<member name="camera_scale" type="float" setter="set_camera_scale" getter="get_camera_scale" default="1.0">
 			Scales the clipmap target's own loaded area: [member distance] x camera_scale regions. 1 is the normal area, 0 removes it so that only keep shapes load. Lowering it evicts the area it gave up at once, with no hysteresis band. To shrink gradually, lower it a little every frame. [method clear_keep] resets it to 1.
 		</member>
@@ -168,7 +218,7 @@
 			Alias target of [member Terrain3D.streaming_frame_budget_ms].
 		</member>
 		<member name="keep_cache_limit" type="int" setter="set_keep_cache_limit" getter="get_keep_cache_limit" default="128">
-			The most region bodies kept in the RAM cache for keep shapes beyond the region map window while [member mode] is DISK. Each cached region costs its full raw size (about 3 MB at 512 m with all maps). RAM mode caches everything anyway.
+			The most region bodies kept in the RAM cache for keep shapes beyond the region map window while [member mode] is DISK. Each cached region costs its full raw size (about 3 MB at 512 m with all maps). RAM mode caches everything anyway. Prefetching a whole corridor (see [method set_keep_path_ahead]) needs a limit of at least the number of its regions beyond the window and the pool, [code skip-lint]outside_window[/code] from [method get_path_cost] and more.
 		</member>
 		<member name="mode" type="int" setter="set_mode" getter="get_mode" enum="Terrain3DStreamer.StreamMode" default="0">
 			What eviction does with a region's data. DISK drops the region; RAM keeps every body cached in memory (and prefetches the rest of the world in the background with spare load budget), so only the GPU layers follow the loaded area and revisits never touch the disk. RAM mode trades memory for the smoothest possible region changes. In either mode a region's edits are written back only when [member persist_edits] is on.
