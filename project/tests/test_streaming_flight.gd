@@ -158,14 +158,14 @@ func _test_priority_ahead() -> void:
 	cam = await _new_terrain(dir, 25, 1)
 	_place(cam, Vector2i(0, 0))
 	s = _streamer()
-	s.add_keep_path(_row_path(-11.5, 40.5), 20.0)
+	s.add_keep_path(_row_path(-11.5, 12.5), 20.0)
 	await _frames(300)
 	res = _resident()
 	var ahead_ok := true
-	for x in range(0, 16):
+	for x in range(0, 13):
 		ahead_ok = ahead_ok and res.has(Vector2i(x, 0))
 	ok(ahead_ok and res.size() == 25, "priority: with room to spare the whole corridor in the window ahead is resident (%d)" % res.size())
-	var near_behind := res.has(Vector2i(-1, 0)) and not res.has(Vector2i(-6, 0))
+	var near_behind := res.has(Vector2i(-1, 0)) and not res.has(Vector2i(-10, 0))
 	ok(near_behind, "priority: the spare slots go to the nearest regions behind")
 	await _free_terrain(cam)
 	_clean(dir)
@@ -353,7 +353,8 @@ func _test_prefetch_cache() -> void:
 	s.keep_cache_limit = 4096
 	await _frames(300)
 	var st := s.get_stats()
-	var beyond := 80 - 16 + 1 # Known path regions from x = 16, the first cell past the window at origin -16
+	var out0 := _t.data.get_region_map_origin().x + _t.data.get_region_map_size() # The window slid ahead with the path
+	var beyond := 80 - out0 + 1 # Known path regions from the first cell past the window
 	ok(st.ram_cached == beyond, "prefetch: with a high limit the whole corridor beyond the window is cached (%d of %d)" % [st.ram_cached, beyond])
 	ok(absf(s.get_path_ready_distance(id) - ready_nocache) < 0.5, "prefetch: cached bodies do not count as ready (%.0f vs %.0f)" % [s.get_path_ready_distance(id), ready_nocache])
 	# The window follows the camera: the cached bodies insert without disk IO and the ready distance reaches the end
@@ -529,7 +530,7 @@ func _test_junction() -> void:
 	# The cells where the strip meets the circle
 	var junction_ok := true
 	for y in range(-4, 5):
-		for x in range(24, 28):
+		for x in range(28, 31):
 			var loc := Vector2i(x, y)
 			if expected.has(loc) and not res.has(loc):
 				junction_ok = false

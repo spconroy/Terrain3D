@@ -162,6 +162,19 @@ func _ramp(height: float) -> float:
 	return minf(r, length * 0.5)
 
 
+## The ground in front of the camera that must be loaded for the sharp central area of the view (the edges
+## are blurred): how far ahead (the ground at far_angle_deg below the horizon, at least) and how wide at that
+## distance, from the cruise altitude, the pitch, the vertical field of view and the share of it that is sharp.
+## Use far as safety and half_width as the corridor radius and the cone half width.
+static func view_footprint(p_altitude: float, p_pitch_deg: float, p_vfov_deg: float, p_aspect: float = 16.0 / 9.0,
+		p_sharp: float = 0.35, p_far_angle_deg: float = 6.0, p_margin: float = 100.0) -> Dictionary:
+	var sharp_v := p_vfov_deg * p_sharp
+	var angle := maxf(-p_pitch_deg - sharp_v * 0.5, p_far_angle_deg) # Below the horizon at the sharp area's far edge
+	var far := p_altitude / tan(deg_to_rad(angle))
+	var sharp_h := 2.0 * atan(tan(deg_to_rad(sharp_v) * 0.5) * p_aspect)
+	return {"far": far, "half_width": far * tan(sharp_h * 0.5) + p_margin}
+
+
 ## Landed: at the end of the path, at rest, and the destination loaded
 func is_done(dest_ready: bool = true) -> bool:
 	return length - distance <= 0.5 and speed < 1.0 and dest_ready
