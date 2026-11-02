@@ -76,6 +76,7 @@ private:
 	int _keep_cache_limit = 128; // Regions outside the map window whose bodies may be cached
 	real_t _behind_limit = -1.f; // Keep nothing further than this behind the direction of travel, negative = no limit
 	real_t _frame_budget_ms = 2.f; // Main thread time for insertions and evictions per physics frame, 0 = loads_per_frame
+	int _gate_timeout_ms = 0; // A region held by the insert gate is inserted anyway after this long, 0 = wait forever
 
 	// A region whose texture layers are being uploaded over several frames
 	struct Staged {
@@ -94,6 +95,20 @@ private:
 		bool save_16_bit = false;
 		int64_t task = -1;
 	};
+
+	// Optional gate(location: Vector2i) -> bool, called on the main thread before a loaded region is
+	// inserted. A region it refuses waits as a body in the RAM cache, holding no slot, and is asked again each step.
+	Callable _insert_gate;
+	struct Gated {
+		uint64_t since = 0; // msec time the gate first refused it
+		uint64_t seen = 0; // Gate step that last found it waiting; entries not seen this step are forgotten
+		bool held = false; // The last answer was no
+		bool timed_out = false; // Past gate_timeout_ms: no longer asked
+	};
+	HashMap<Vector2i, Gated> _gated;
+	uint64_t _gate_step = 0;
+	uint64_t _stat_gate_timeouts = 0;
+	uint64_t _stat_gate_wait_max = 0; // msec, of regions already inserted
 
 	// Optional location -> {path, rotation, mirror, read_only} override, called on the main thread
 	Callable _resolver;
@@ -166,6 +181,8 @@ private:
 	void _poll_retiring(const bool p_wait);
 	bool _budget_spent(const uint64_t p_start_us) const;
 	bool _can_insert(const int p_inserted, const bool p_worked, const uint64_t p_start_us) const;
+	bool _gate_open(const Vector2i &p_region_loc);
+	void _gate_done(const Vector2i &p_region_loc);
 	void _land(const Vector2i &p_region_loc, const real_t p_ms);
 	bool _insert(Terrain3DData *p_data, const Ref<Terrain3DRegion> &p_region, const uint64_t p_start_us, bool &r_worked);
 	void _advance_staged(Terrain3DData *p_data, const uint64_t p_start_us, bool &r_worked);
@@ -227,6 +244,12 @@ public:
 	void remove_keep(const int p_id);
 	void clear_keep();
 	int get_keep_count() const { return _keep.size(); }
+
+	void set_insert_gate(const Callable &p_gate);
+	Callable get_insert_gate() const { return _insert_gate; }
+	void set_gate_timeout_ms(const int p_ms) { _gate_timeout_ms = CLAMP(p_ms, 0, 3600000); }
+	int get_gate_timeout_ms() const { return _gate_timeout_ms; }
+	TypedArray<Vector2i> get_gated_regions() const;
 
 	void set_resolver(const Callable &p_resolver);
 	Callable get_resolver() const { return _resolver; }

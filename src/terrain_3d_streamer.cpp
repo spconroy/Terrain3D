@@ -128,6 +128,7 @@ void Terrain3DStreamer::_flush_ram_cache() {
 		}
 	}
 	_ram_cache.clear();
+	_gated.clear(); // Gated bodies lived in the cache
 }
 
 bool Terrain3DStreamer::is_active() const {
@@ -147,6 +148,7 @@ void Terrain3DStreamer::abort_pending() {
 	// Staged regions hold pool slots of the data being torn down or rebuilt
 	_staged.clear();
 	_staged_set.clear();
+	_gated.clear();
 	_poll_retiring(true);
 }
 
@@ -178,6 +180,28 @@ void Terrain3DStreamer::clear_virtual_locations() {
 	scan_directory();
 }
 
+// The insert gate decides when a loaded region may become visible: Callable(location: Vector2i) -> bool.
+// It is called on the main thread, for every region that is ready to be inserted, on each step, so it must be
+// a cheap lookup and must not change the streamer. false holds the region: its body waits in the RAM cache,
+// holds no pool slot and counts as not visible (get_path_ready_distance, nearest_missing). true, anything
+// that is not a bool, or an invalid Callable lets it through. After gate_timeout_ms it is inserted anyway.
+void Terrain3DStreamer::set_insert_gate(const Callable &p_gate) {
+	_insert_gate = p_gate;
+	if (!_insert_gate.is_valid()) {
+		_gated.clear();
+	}
+}
+
+TypedArray<Vector2i> Terrain3DStreamer::get_gated_regions() const {
+	TypedArray<Vector2i> out;
+	for (const KeyValue<Vector2i, Gated> &kv : _gated) {
+		if (kv.value.held) {
+			out.push_back(kv.key);
+		}
+	}
+	return out;
+}
+
 // Scans the data directory for region locations. Only file names are read, nothing is loaded.
 void Terrain3DStreamer::scan_directory() {
 	IS_INIT(VOID);
@@ -194,6 +218,8 @@ void Terrain3DStreamer::scan_directory() {
 	_landed_total = 0;
 	_evicted_total = 0;
 	_land_ms_avg = 0.f;
+	_stat_gate_timeouts = 0;
+	_stat_gate_wait_max = 0;
 	for (const Vector2i &loc : _virtual) {
 		_known.push_back(loc);
 		_known_set.insert(loc);
@@ -595,6 +621,7 @@ void Terrain3DStreamer::step() {
 		bool behind = false;
 		int tier = 2;
 		real_t rank = 0.f;
+		bool cached = false; // The body waits in the RAM cache (held by the insert gate), no load to collect
 	};
 	Vector<Landing> ready;
 	Vector<Vector2i> drop;
@@ -646,6 +673,44 @@ void Terrain3DStreamer::step() {
 		_resolved.erase(drop[i]);
 		_discard.erase(drop[i]);
 	}
+	// With an insert gate, bodies it holds back wait in the cache and compete with new loads in one order
+	const bool gating = _insert_gate.is_valid();
+	_gate_step += 1;
+	if (gating) {
+		for (const KeyValue<Vector2i, Want> &kv : wanted) {
+			const Vector2i &loc = kv.key;
+			if (kv.value.cache_only || !_ram_cache.has(loc) || data->get_region_map_index(loc) < 0 || deferred.has(loc) ||
+					resident.has(loc) || data->has_region(loc) || _is_failed(loc) || _pending.has(loc) ||
+					_staged_set.has(loc) || _saving.has(loc)) {
+				continue;
+			}
+			Landing l;
+			l.loc = loc;
+			l.behind = kv.value.behind;
+			l.tier = kv.value.tier;
+			l.rank = kv.value.rank;
+			l.cached = true;
+			ready.push_back(l);
+		}
+		for (const Landing &l : ready) {
+			Gated *g = _gated.getptr(l.loc);
+			if (g != nullptr) {
+				g->seen = _gate_step;
+			}
+		}
+	}
+	if (!_gated.is_empty()) {
+		// Forget what is no longer waiting here: inserted, evicted, or left the window or the keep set
+		Vector<Vector2i> gone;
+		for (const KeyValue<Vector2i, Gated> &kv : _gated) {
+			if (kv.value.seen != _gate_step) {
+				gone.push_back(kv.key);
+			}
+		}
+		for (int i = 0; i < gone.size(); i++) {
+			_gated.erase(gone[i]);
+		}
+	}
 	struct LandingSort {
 		bool operator()(const Landing &a, const Landing &b) const {
 			if (a.behind != b.behind) {
@@ -660,32 +725,69 @@ void Terrain3DStreamer::step() {
 	ready.sort_custom<LandingSort>();
 	int inserted = 0;
 	bool worked = false;
+	bool full = false; // The insertion budget is spent; with an insert gate the rest is still asked, to hold it
 	_advance_staged(data, start_us, worked); // Finish a region begun on an earlier frame first
 	for (int i = 0; i < ready.size(); i++) {
-		if (!_can_insert(inserted, worked, start_us)) {
-			break;
+		if (!full && !_can_insert(inserted, worked, start_us)) {
+			if (!gating) {
+				break;
+			}
+			full = true;
 		}
-		Ref<Terrain3DRegion> region = ResourceLoader::get_singleton()->load_threaded_get(ready[i].path);
-		_pending.erase(ready[i].loc);
-		_stat_disk_needed += 1;
-		if (region.is_null()) {
-			_resolved.erase(ready[i].loc);
-			LOG(ERROR, "Streaming load returned null region ", ready[i].loc);
-			_mark_failed(ready[i].loc);
+		const Vector2i loc = ready[i].loc;
+		if (gating && !_gate_open(loc)) {
+			// Held back. It takes neither a slot nor insertion budget: a finished load leaves the loader (and its
+			// concurrent load place) for the cache, a cached body stays, and the next ready region is tried
+			if (!ready[i].cached) {
+				Ref<Terrain3DRegion> body = ResourceLoader::get_singleton()->load_threaded_get(ready[i].path);
+				_pending.erase(loc);
+				_stat_disk_needed += 1;
+				if (body.is_null()) {
+					_resolved.erase(loc);
+					LOG(ERROR, "Streaming load returned null region ", loc);
+					_mark_failed(loc);
+					_gated.erase(loc);
+					continue;
+				}
+				_finish_body(body, loc, ready[i].path);
+				_resolved.erase(loc);
+				body->set_modified(false);
+				_ram_cache[loc] = body;
+			}
 			continue;
 		}
-		_finish_body(region, ready[i].loc, ready[i].path);
-		_resolved.erase(ready[i].loc);
-		// Loading runs the setters, which flag the region modified. Reset it like load_directory
-		// does; otherwise persist_edits would rewrite every region it evicts. The on disk version is
-		// left alone: streaming is read only, and a save stamps the current version itself
-		region->set_modified(false);
+		if (full) {
+			continue;
+		}
+		Ref<Terrain3DRegion> region;
+		if (ready[i].cached) {
+			region = _ram_cache[loc];
+			_ram_cache.erase(loc);
+			region->set_location(loc);
+		} else {
+			region = ResourceLoader::get_singleton()->load_threaded_get(ready[i].path);
+			_pending.erase(loc);
+			_stat_disk_needed += 1;
+			if (region.is_null()) {
+				_resolved.erase(loc);
+				LOG(ERROR, "Streaming load returned null region ", loc);
+				_mark_failed(loc);
+				continue;
+			}
+			_finish_body(region, loc, ready[i].path);
+			_resolved.erase(loc);
+			// Loading runs the setters, which flag the region modified. Reset it like load_directory
+			// does; otherwise persist_edits would rewrite every region it evicts. The on disk version is
+			// left alone: streaming is read only, and a save stamps the current version itself
+			region->set_modified(false);
+		}
 		if (_insert(data, region, start_us, worked)) {
 			inserted += 1;
-		} else if (data->get_free_slot_count() > 0) {
+			_gate_done(loc);
+		} else if (!ready[i].cached && data->get_free_slot_count() > 0) {
 			// Rejected with a slot available means the body itself is bad. Never
 			// re-request it, pool pressure alone retries fine
-			_mark_failed(ready[i].loc, true);
+			_mark_failed(loc, true);
 		}
 	}
 	// How far is the nearest wanted region that is not visible yet? Staged and cached regions are not.
@@ -707,6 +809,9 @@ void Terrain3DStreamer::step() {
 		if (data->get_region_map_index(kv.key) >= 0 && !deferred.has(kv.key) && (w == nullptr || !w->cache_only)) {
 			slot_pending++;
 		}
+	}
+	for (const KeyValue<Vector2i, Gated> &kv : _gated) {
+		slot_pending += kv.value.seen == _gate_step ? 1 : 0; // A body waiting for the gate will need a slot too
 	}
 	int io_free = _concurrent_loads - (int)_pending.size();
 	int slot_free = data->get_free_slot_count() - slot_pending;
@@ -748,7 +853,11 @@ void Terrain3DStreamer::step() {
 		}
 		if (_ram_cache.has(loc)) {
 			// Cached body (RAM mode revisit or a prefetch for a keep shape): it is already
-			// decoded, only the GPU upload remains. Still bounded by loads_per_frame
+			// decoded, only the GPU upload remains. Still bounded by loads_per_frame.
+			// With an insert gate the ones inside the window were handled with the landings above
+			if (gating && in_win) {
+				continue;
+			}
 			if (!in_win || !_can_insert(inserted, worked, start_us) || data->get_free_slot_count() <= 0) {
 				continue;
 			}
@@ -851,6 +960,16 @@ Dictionary Terrain3DStreamer::get_stats() const {
 	d["disk_loads_needed"] = (int64_t)_stat_disk_needed; // Threaded loads consumed for regions needed now (not cached ahead of a path's reach, not RAM cache inserts)
 	d["recentres"] = (int64_t)_stat_recentres; // Window moves so far
 	d["nearest_missing"] = _stat_nearest; // Meters to the nearest wanted region not visible yet, not behind the target, -1 if none
+	int gated = 0;
+	uint64_t wait_max = _stat_gate_wait_max;
+	const uint64_t now = Time::get_singleton()->get_ticks_msec();
+	for (const KeyValue<Vector2i, Gated> &kv : _gated) {
+		gated += kv.value.held ? 1 : 0;
+		wait_max = MAX(wait_max, now - kv.value.since);
+	}
+	d["gated"] = gated; // Loaded regions the insert gate holds back now
+	d["gate_timeouts"] = (int64_t)_stat_gate_timeouts; // Regions inserted anyway after gate_timeout_ms
+	d["gate_wait_ms_max"] = (int64_t)wait_max; // Longest time the gate held a region, waiting now or inserted since
 	return d;
 }
 
@@ -1460,6 +1579,46 @@ bool Terrain3DStreamer::_can_insert(const int p_inserted, const bool p_worked, c
 	return p_inserted < _loads_per_frame;
 }
 
+// Asks the insert gate whether a region may become visible. The first refusal starts its clock; once
+// gate_timeout_ms has passed the region is let through without asking and counted in gate_timeouts.
+bool Terrain3DStreamer::_gate_open(const Vector2i &p_region_loc) {
+	const uint64_t now = Time::get_singleton()->get_ticks_msec();
+	Gated *g = _gated.getptr(p_region_loc);
+	if (g != nullptr && g->timed_out) {
+		return true;
+	}
+	if (g != nullptr && _gate_timeout_ms > 0 && now - g->since >= uint64_t(_gate_timeout_ms)) {
+		g->timed_out = true;
+		g->held = false;
+		_stat_gate_timeouts += 1;
+		return true;
+	}
+	bool open = true;
+	if (_insert_gate.is_valid()) {
+		Variant answer = _insert_gate.call(p_region_loc);
+		open = answer.get_type() != Variant::BOOL || bool(answer); // Only a plain false holds a region
+	}
+	if (g == nullptr && !open) {
+		Gated gated;
+		gated.since = now;
+		gated.seen = _gate_step;
+		g = &(_gated[p_region_loc] = gated);
+	}
+	if (g != nullptr) {
+		g->held = !open;
+	}
+	return open;
+}
+
+// A region the gate held became visible: records how long it waited
+void Terrain3DStreamer::_gate_done(const Vector2i &p_region_loc) {
+	const Gated *g = _gated.getptr(p_region_loc);
+	if (g != nullptr) {
+		_stat_gate_wait_max = MAX(_stat_gate_wait_max, Time::get_singleton()->get_ticks_msec() - g->since);
+		_gated.erase(p_region_loc);
+	}
+}
+
 // Bookkeeping once a region is resident
 void Terrain3DStreamer::_land(const Vector2i &p_region_loc, const real_t p_ms) {
 	uint64_t t0 = Time::get_singleton()->get_ticks_usec();
@@ -1676,6 +1835,11 @@ void Terrain3DStreamer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("remove_keep", "id"), &Terrain3DStreamer::remove_keep);
 	ClassDB::bind_method(D_METHOD("clear_keep"), &Terrain3DStreamer::clear_keep);
 	ClassDB::bind_method(D_METHOD("get_keep_count"), &Terrain3DStreamer::get_keep_count);
+	ClassDB::bind_method(D_METHOD("set_insert_gate", "gate"), &Terrain3DStreamer::set_insert_gate);
+	ClassDB::bind_method(D_METHOD("get_insert_gate"), &Terrain3DStreamer::get_insert_gate);
+	ClassDB::bind_method(D_METHOD("set_gate_timeout_ms", "ms"), &Terrain3DStreamer::set_gate_timeout_ms);
+	ClassDB::bind_method(D_METHOD("get_gate_timeout_ms"), &Terrain3DStreamer::get_gate_timeout_ms);
+	ClassDB::bind_method(D_METHOD("get_gated_regions"), &Terrain3DStreamer::get_gated_regions);
 	ClassDB::bind_method(D_METHOD("set_resolver", "resolver"), &Terrain3DStreamer::set_resolver);
 	ClassDB::bind_method(D_METHOD("get_resolver"), &Terrain3DStreamer::get_resolver);
 	ClassDB::bind_method(D_METHOD("register_virtual_locations", "locations"), &Terrain3DStreamer::register_virtual_locations);
@@ -1695,6 +1859,8 @@ void Terrain3DStreamer::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "concurrent_loads", PROPERTY_HINT_RANGE, "1,8,1"), "set_concurrent_loads", "get_concurrent_loads");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "loads_per_frame", PROPERTY_HINT_RANGE, "1,8,1"), "set_loads_per_frame", "get_loads_per_frame");
 	ADD_PROPERTY(PropertyInfo(Variant::CALLABLE, "resolver", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_resolver", "get_resolver");
+	ADD_PROPERTY(PropertyInfo(Variant::CALLABLE, "insert_gate", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_insert_gate", "get_insert_gate");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "gate_timeout_ms", PROPERTY_HINT_RANGE, "0,3600000,1,or_greater,suffix:ms"), "set_gate_timeout_ms", "get_gate_timeout_ms");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "persist_edits"), "set_persist_edits", "get_persist_edits");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "camera_scale", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_camera_scale", "get_camera_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "keep_cache_limit", PROPERTY_HINT_RANGE, "0,4096,1"), "set_keep_cache_limit", "get_keep_cache_limit");
