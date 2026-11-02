@@ -634,6 +634,22 @@ void Terrain3DData::enable_streaming(const int p_slot_capacity) {
 }
 
 Error Terrain3DData::add_region_streamed(const Ref<Terrain3DRegion> &p_region) {
+	int slot = -1;
+	Error err = reserve_region_streamed(p_region, slot);
+	if (err != OK || slot < 0) {
+		return err;
+	}
+	upload_region_streamed(p_region, slot, TYPE_HEIGHT);
+	upload_region_streamed(p_region, slot, TYPE_CONTROL);
+	upload_region_streamed(p_region, slot, TYPE_COLOR);
+	return commit_region_streamed(p_region, slot);
+}
+
+// Step 1 of a streamed insertion: validates the body, sanitizes its maps and takes a
+// pool slot. The region stays invisible until commit_region_streamed(). r_slot is -1
+// when the region was already resident.
+Error Terrain3DData::reserve_region_streamed(const Ref<Terrain3DRegion> &p_region, int &r_slot) {
+	r_slot = -1;
 	ERR_FAIL_COND_V(!_streaming, FAILED);
 	ERR_FAIL_COND_V(p_region.is_null(), FAILED);
 	Vector2i loc = p_region->get_location();
@@ -664,20 +680,42 @@ Error Terrain3DData::add_region_streamed(const Ref<Terrain3DRegion> &p_region) {
 	}
 	p_region->sanitize_maps(color_enabled);
 	p_region->set_deleted(false);
-	int slot = _free_slots[_free_slots.size() - 1];
+	r_slot = _free_slots[_free_slots.size() - 1];
 	_free_slots.remove_at(_free_slots.size() - 1);
-	_slot_of[loc] = slot;
-	_slot_locs[slot] = loc;
+	return OK;
+}
+
+// Step 2: uploads one map of a reserved region into its texture array layer
+void Terrain3DData::upload_region_streamed(const Ref<Terrain3DRegion> &p_region, const int p_slot, const MapType p_map_type) {
+	switch (p_map_type) {
+		case TYPE_HEIGHT: {
+			_generated_height_maps.update(p_region->get_height_map(), p_slot);
+		} break;
+		case TYPE_CONTROL: {
+			_generated_control_maps.update(p_region->get_control_map(), p_slot);
+		} break;
+		case TYPE_COLOR: {
+			if (_terrain != nullptr && _terrain->get_color_map_enabled() && p_region->get_color_map().is_valid()) {
+				_generated_color_maps.update(p_region->get_color_map(), p_slot);
+			}
+		} break;
+		default:
+			break;
+	}
+}
+
+// Step 3: makes the uploaded region resident and visible
+Error Terrain3DData::commit_region_streamed(const Ref<Terrain3DRegion> &p_region, const int p_slot) {
+	Vector2i loc = p_region->get_location();
+	int map_index = get_region_map_index(loc);
+	ERR_FAIL_COND_V_MSG(map_index < 0, FAILED, "Region location out of bounds");
+	_slot_of[loc] = p_slot;
+	_slot_locs[p_slot] = loc;
 	_regions[loc] = p_region;
 	if (!_region_locations.has(loc)) {
 		_region_locations.push_back(loc);
 	}
-	_region_map[map_index] = slot + 1;
-	_generated_height_maps.update(p_region->get_height_map(), slot);
-	_generated_control_maps.update(p_region->get_control_map(), slot);
-	if (color_enabled && p_region->get_color_map().is_valid()) {
-		_generated_color_maps.update(p_region->get_color_map(), slot);
-	}
+	_region_map[map_index] = p_slot + 1;
 	calc_height_range();
 	// Consumers follow signals: the material re-sends the region map and slot
 	// locations (the array RIDs never change), and height_maps_changed refreshes the
