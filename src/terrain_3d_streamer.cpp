@@ -280,7 +280,9 @@ void Terrain3DStreamer::step() {
 				outside_now += (w.x < origin.x || w.y < origin.y || w.x >= origin.x + window || w.y >= origin.y + window) ? 1 : 0;
 				outside_after += (w.x < target.x || w.y < target.y || w.x >= target.x + window || w.y >= target.y + window) ? 1 : 0;
 			}
-			if (outside_now == 0 || outside_after >= outside_now) {
+			// ...and in jumps of a few regions, so a fast flight does not rewrite the map every region it crosses
+			const Vector2i shift = target - origin;
+			if (outside_now == 0 || outside_after >= outside_now || (ABS(shift.x) < WINDOW_SLIDE_MIN && ABS(shift.y) < WINDOW_SLIDE_MIN)) {
 				target = origin;
 			}
 		}

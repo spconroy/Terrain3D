@@ -31,6 +31,7 @@ public: // Constants
 
 	static inline const int FAIL_RETRIES = 3; // A failing location is requested this many times, then ignored until a rescan
 	static inline const uint64_t FAIL_RETRY_MSEC = 5000; // Wait between requests of a failed location
+	static inline const int WINDOW_SLIDE_MIN = 3; // The region map window slides ahead along a path in jumps of at least this many regions
 
 	enum StreamMode {
 		DISK, // RAM and GPU follow the loaded area; evicted regions save and drop
