@@ -41,7 +41,7 @@ func _settle(max_frames: int) -> void:
 		RenderingServer.emit_signal("frame_pre_draw")
 		var n: int = _t.data.get_region_count()
 		var st: Dictionary = _t.get_streaming_stats()
-		if n == last and int(st.get("inflight", 0)) == 0 and int(st.get("staged", 0)) == 0:
+		if n == last and int(st.get("inflight", 0)) == 0 and int(st.get("staged", 0)) == 0 and int(st.get("saving", 0)) == 0:
 			stable += 1
 			if stable >= 15:
 				return

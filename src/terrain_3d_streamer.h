@@ -59,12 +59,24 @@ private:
 		real_t ms = 0.f; // Main thread time spent on it
 	};
 
+	// An evicted region handed to a worker thread: written to disk if it carries edits,
+	// then released there, so neither the save nor freeing its images stalls the main thread
+	struct RetireJob {
+		Ref<Terrain3DRegion> region;
+		Vector2i loc;
+		String path; // Empty when nothing needs saving
+		bool save_16_bit = false;
+		int64_t task = -1;
+	};
+
 	// Work data
 	Vector<Vector2i> _known; // Region locations present on disk
 	HashSet<Vector2i> _known_set;
 	HashMap<Vector2i, uint64_t> _failed; // Failed loads, location -> msec time it may be requested again
 	HashMap<Vector2i, int> _fail_count; // Failures per location, a location is given up on after FAIL_RETRIES
 	HashMap<Vector2i, String> _pending; // In flight threaded loads, location -> path
+	Vector<RetireJob *> _retiring; // Oldest first
+	HashSet<Vector2i> _saving; // Locations whose retiring job writes the file; not reloaded until done
 	Vector<Staged> _staged; // Reserved regions being uploaded, oldest first
 	HashSet<Vector2i> _staged_set;
 	HashMap<Vector2i, Ref<Terrain3DRegion>> _ram_cache; // RAM mode: evicted bodies, plus prefetched ones
@@ -79,6 +91,9 @@ private:
 	real_t _distance_to(const Vector2i &p_region_loc, const Vector2i &p_focus_loc) const;
 	void _apply_distance_limit();
 	void _collision_refresh(const Vector2i &p_region_loc);
+	void _retire(const Vector2i &p_region_loc, const Ref<Terrain3DRegion> &p_region, const String &p_dir);
+	void _run_retire_job(const int64_t p_job);
+	void _poll_retiring(const bool p_wait);
 	bool _budget_spent(const uint64_t p_start_us) const;
 	bool _can_insert(const int p_inserted, const bool p_worked, const uint64_t p_start_us) const;
 	void _land(const Vector2i &p_region_loc, const real_t p_ms);
