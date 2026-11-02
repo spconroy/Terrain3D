@@ -426,7 +426,7 @@
 			Alias for [member Terrain3DStreamer.distance].
 		</member>
 		<member name="streaming_enabled" type="bool" setter="set_streaming_enabled" getter="get_streaming_enabled" default="false">
-			Enables region streaming at runtime. Instead of loading every region in [member data_directory] up front, regions within [member streaming_distance] of the clipmap target are loaded on background threads and evicted as the target moves away, so memory scales with the loaded area instead of the whole terrain. Regions modified at runtime are saved back to [member data_directory] before eviction. Has no effect inside the editor, which always keeps the full terrain loaded; see [method is_streaming_active].
+			Enables region streaming at runtime. Instead of loading every region in [member data_directory] up front, regions within [member streaming_distance] of the clipmap target are loaded on background threads and evicted as the target moves away, so memory scales with the loaded area instead of the whole terrain. Streaming is a read-only view of [member data_directory]: edits made to a loaded region at runtime are dropped when it is evicted unless [member streaming_persist_edits] is on. Has no effect inside the editor, which always keeps the full terrain loaded and saves every region as usual, so the other [code skip-lint]streaming_[/code] properties only take effect in the game; see [method is_streaming_active].
 			Alias for [member Terrain3DStreamer.enabled].
 		</member>
 		<member name="streaming_loads_per_frame" type="int" setter="set_streaming_loads_per_frame" getter="get_streaming_loads_per_frame" default="1">
@@ -438,7 +438,7 @@
 			Alias for [member Terrain3DStreamer.mode].
 		</member>
 		<member name="streaming_persist_edits" type="bool" setter="set_streaming_persist_edits" getter="get_streaming_persist_edits" default="false">
-			Whether a region modified at runtime is written back to the data directory when it is evicted. Off by default: streaming only reads the data on disk. See [member Terrain3DStreamer.persist_edits].
+			Whether a region modified at runtime is written back to the data directory when it is evicted. Off by default: streaming only reads the data on disk, so eviction drops the region together with any runtime edits and a revisit reloads the on-disk version. In RAM mode edits survive eviction in the cache until it is flushed (leaving RAM mode or disabling streaming), which writes them back only when this is on. See [member Terrain3DStreamer.persist_edits].
 			Alias for [member Terrain3DStreamer.persist_edits].
 		</member>
 		<member name="streaming_shape" type="int" setter="set_streaming_shape" getter="get_streaming_shape" enum="Terrain3DStreamer.StreamShape" default="0">

@@ -619,6 +619,7 @@ void Terrain3D::set_streaming_enabled(const bool p_enabled) {
 		return;
 	}
 	_streamer->set_enabled(p_enabled);
+	update_configuration_warnings();
 	// The load path differs at initialization, so toggling live reinitializes
 	// the terrain like a data directory change does.
 	if (_initialized && !IS_EDITOR) {
@@ -1231,6 +1232,9 @@ PackedStringArray Terrain3D::_get_configuration_warnings() const {
 	PackedStringArray psa;
 	if (_data_directory.is_empty()) {
 		psa.push_back("No data directory specified. Select a directory then save the scene to write data.");
+	}
+	if (get_streaming_enabled() && IS_EDITOR) {
+		psa.push_back("Region streaming is enabled but only runs in the game. The editor always keeps every region loaded, so the streaming_ settings have no effect here.");
 	}
 	if (_warnings & WARN_MISMATCHED_SIZE) {
 		psa.push_back("Texture dimensions don't match. Double-click a texture in the FileSystem panel to see its size. Read Texture Prep in docs.");
