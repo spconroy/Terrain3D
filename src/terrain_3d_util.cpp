@@ -87,9 +87,14 @@ Vector2i Terrain3DUtil::filename_to_location(const String &p_filename) {
 }
 
 // Expects a string formatted as: "±##±##" which returns (##,##)
+// Values of 100 or more have more digits, eg. "-100_105". The second value begins at the next sign, "_" or "-".
 Vector2i Terrain3DUtil::string_to_location(const String &p_string) {
-	String x_str = p_string.left(3).replace("_", "");
-	String y_str = p_string.right(3).replace("_", "");
+	int split = 1;
+	while (split < p_string.length() && p_string[split] != '_' && p_string[split] != '-') {
+		split++;
+	}
+	String x_str = p_string.left(split).replace("_", "");
+	String y_str = p_string.substr(split).replace("_", "");
 	if (!x_str.is_valid_int() || !y_str.is_valid_int()) {
 		LOG(ERROR, "Malformed string '", p_string, "'. Result: ", x_str, ", ", y_str);
 		return V2I_MAX;
