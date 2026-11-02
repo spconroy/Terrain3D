@@ -154,7 +154,7 @@
 			<return type="Vector2" />
 			<param index="0" name="image" type="Image" />
 			<description>
-				Returns the minimum and maximum r channel values of an Image. Used for heightmaps.
+				Returns the minimum and maximum r channel values of an Image. Used for heightmaps. Images in [code skip-lint]Image.FORMAT_RF[/code], the heightmap format, are read directly and are much faster than other formats.
 			</description>
 		</method>
 		<method name="get_overlay" qualifiers="static">
