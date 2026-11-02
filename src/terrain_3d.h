@@ -64,6 +64,7 @@ private:
 
 	// Regions
 	RegionSize _region_size = SIZE_256;
+	int _region_map_size = Terrain3DData::REGION_MAP_SIZE;
 	bool _save_16_bit = false;
 	bool _color_map_enabled = true;
 	CompressMode _color_compress_mode = COMPRESS_NONE;
@@ -182,6 +183,8 @@ public:
 	void set_region_size(const RegionSize p_size);
 	RegionSize get_region_size() const { return _region_size; }
 	void change_region_size(const RegionSize p_size) { _data ? _data->change_region_size(p_size) : void(); }
+	void set_region_map_size(const int p_size);
+	int get_region_map_size() const { return _region_map_size; }
 	void set_save_16_bit(const bool p_enabled);
 	bool get_save_16_bit() const { return _save_16_bit; }
 	void set_color_map_enabled(const bool p_enabled);

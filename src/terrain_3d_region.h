@@ -14,6 +14,9 @@ class Terrain3DRegion : public Resource {
 	CLASS_NAME();
 
 public: // Constants
+	// Region locations are global but limited so location * region_size stays within int32
+	static inline const int MAX_LOCATION = 1 << 20;
+
 	enum MapType {
 		TYPE_HEIGHT,
 		TYPE_CONTROL,

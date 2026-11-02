@@ -47,10 +47,13 @@ int Terrain3DStreamer::get_required_slots(const int p_distance) const {
 	return count;
 }
 
-// Largest distance the current slot capacity can hold with the current shape
+// Largest distance the current slot capacity can hold with the current shape, and
+// whose retained area (2 * (distance + 1) + 1 regions across) fits the region map window
 int Terrain3DStreamer::get_max_distance() const {
+	const Terrain3DData *data = _terrain != nullptr ? _terrain->get_data() : nullptr;
+	const int window = data != nullptr ? data->get_region_map_size() : Terrain3DData::REGION_MAP_SIZE;
 	int d = 1;
-	while (d < 15 && get_required_slots(d + 1) <= _slots) {
+	while (d < 15 && get_required_slots(d + 1) <= _slots && 2 * (d + 2) + 1 <= window) {
 		d++;
 	}
 	return d;
@@ -59,7 +62,7 @@ int Terrain3DStreamer::get_max_distance() const {
 // Lowers distance to what the pool can hold. A distance the slots cannot hold
 // would permanently starve loading: the pool fills, nothing beyond it ever
 // inserts, and nothing evicts, leaving holes in the world.
-void Terrain3DStreamer::_apply_distance_limit() {
+void Terrain3DStreamer::apply_distance_limit() {
 	int max_distance = get_max_distance();
 	if (_distance > max_distance) {
 		LOG(WARN, "streaming_distance ", _distance, " needs ", get_required_slots(_distance),
@@ -74,7 +77,7 @@ void Terrain3DStreamer::set_shape(const StreamShape p_shape) {
 		return;
 	}
 	_shape = p_shape;
-	_apply_distance_limit();
+	apply_distance_limit();
 }
 
 void Terrain3DStreamer::set_distance(const int p_distance) {
@@ -86,7 +89,7 @@ void Terrain3DStreamer::set_distance(const int p_distance) {
 	if (required > _slots) {
 		_slots = MIN(required, 1024);
 	}
-	_apply_distance_limit(); // Still clamps if even 1024 slots cannot hold it (square distance > 14)
+	apply_distance_limit(); // Still clamps if even 1024 slots cannot hold it (square distance > 14)
 }
 
 void Terrain3DStreamer::set_slots(const int p_slots) {
@@ -94,7 +97,7 @@ void Terrain3DStreamer::set_slots(const int p_slots) {
 	// (2 * 2 + 1)^2 = 25 regions, so a smaller pool starves even at the minimum
 	// distance. Circle needs fewer, but the square worst case is shape safe.
 	_slots = CLAMP(p_slots, 25, 1024);
-	_apply_distance_limit();
+	apply_distance_limit();
 }
 
 void Terrain3DStreamer::set_mode(const StreamMode p_mode) {
@@ -197,6 +200,16 @@ void Terrain3DStreamer::step() {
 	String dir = _terrain->get_data_directory();
 	Vector3 focus = _terrain->get_clipmap_target_position();
 	Vector2i floc = data->get_region_location(focus);
+	// Region locations are unbounded, the region map window is not. Recentre it on the
+	// focus whenever the retained area (distance + 1, see eviction below) leaves it.
+	// Regions left outside are beyond the retained area, so they evict below.
+	const int retained = _distance + 1;
+	const Vector2i origin = data->get_region_map_origin();
+	const int window = data->get_region_map_size();
+	if (floc.x - retained < origin.x || floc.y - retained < origin.y ||
+			floc.x + retained >= origin.x + window || floc.y + retained >= origin.y + window) {
+		data->set_region_map_origin(floc - V2I(window / 2));
+	}
 	// Track the travel direction so regions ahead of travel load first on ties.
 	// A teleport (a jump beyond one region span) resets it.
 	Vector2 fpos = Vector2(focus.x, focus.z);

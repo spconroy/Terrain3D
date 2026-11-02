@@ -311,6 +311,10 @@
 			Applies a [code skip-lint]PhysicsMaterial[/code] override to the entire terrain StaticBody.
 			Alias for [member Terrain3DCollision.physics_material] See that entry for details.
 		</member>
+		<member name="region_map_size" type="int" setter="set_region_map_size" getter="get_region_map_size" default="32">
+			The number of regions on a side of the region map window, 8, 16 or 32. Only the regions in this window are rendered and addressable at once; with [member streaming_enabled] the window follows the clipmap target, so the world can be as large as you have region files. Without streaming the whole world must fit in the window, which is centred on region (0,0) unless you move it with [method Terrain3DData.set_region_map_origin].
+			Streaming keeps [member streaming_distance] + 1 regions on each side of the target inside the window, so a smaller window lowers the largest [member streaming_distance]: (size - 3) / 2, or 14 for the default 32.
+		</member>
 		<member name="region_size" type="int" setter="change_region_size" getter="get_region_size" enum="Terrain3D.RegionSize" default="256">
 			The number of vertices in each region, and the number of pixels for each map in [Terrain3DRegion]. 1 pixel always corresponds to 1 vertex. [member Terrain3D.vertex_spacing] laterally scales regions, but does not change the number of vertices or pixels in each.
 			There is no undo for this operation. However you can apply it again to reslice, as long as your data doesn't hit the maximum boundaries.

@@ -41,8 +41,8 @@ Ref<Terrain3DRegion> Terrain3DEditor::_operate_region(const Vector2i &p_region_l
 	}
 	if (data->get_region_map_index(p_region_loc) < 0) {
 		if (can_print) {
-			LOG(INFO, "Location ", p_region_loc, " out of bounds. Max: ",
-					-Terrain3DData::REGION_MAP_SIZE / 2, " to ", Terrain3DData::REGION_MAP_SIZE / 2 - 1);
+			LOG(INFO, "Location ", p_region_loc, " out of bounds. Region map window: ",
+					data->get_region_map_origin(), " to ", data->get_region_map_origin() + V2I(data->get_region_map_size() - 1));
 		}
 		return Ref<Terrain3DRegion>();
 	}
