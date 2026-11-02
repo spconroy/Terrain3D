@@ -728,8 +728,9 @@ static real_t _point_segment_dist2(const Vector2 &p_point, const Vector2 &p_a, c
 	return (p_point - (p_a + ab * t)).length_squared();
 }
 
-// Liang-Barsky clip of the segment against the rectangle
-static bool _segment_hits_rect(const Vector2 &p_a, const Vector2 &p_b, const Vector2 &p_min, const Vector2 &p_max) {
+// Liang-Barsky clip of the segment against the rectangle. r_t0 and r_t1 receive the parameters of
+// the part inside (0 at p_a, 1 at p_b).
+static bool _segment_clip(const Vector2 &p_a, const Vector2 &p_b, const Vector2 &p_min, const Vector2 &p_max, real_t *r_t0 = nullptr, real_t *r_t1 = nullptr) {
 	Vector2 d = p_b - p_a;
 	real_t t0 = 0.f;
 	real_t t1 = 1.f;
@@ -752,7 +753,17 @@ static bool _segment_hits_rect(const Vector2 &p_a, const Vector2 &p_b, const Vec
 			return false;
 		}
 	}
+	if (r_t0 != nullptr) {
+		*r_t0 = t0;
+	}
+	if (r_t1 != nullptr) {
+		*r_t1 = t1;
+	}
 	return true;
+}
+
+static bool _segment_hits_rect(const Vector2 &p_a, const Vector2 &p_b, const Vector2 &p_min, const Vector2 &p_max) {
+	return _segment_clip(p_a, p_b, p_min, p_max);
 }
 
 real_t Terrain3DStreamer::_region_span() const {
