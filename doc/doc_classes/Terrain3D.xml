@@ -182,6 +182,10 @@
 		<member name="collision_target" type="Node3D" setter="set_collision_target" getter="get_collision_target">
 			In dynamic mode, the terrain collision will center itself at the position of this node. If null, it will fall back to the [member clipmap_target] position and failing that will use the camera position. The camera is always used in the editor. See [method set_camera].
 		</member>
+		<member name="color_map_enabled" type="bool" setter="set_color_map_enabled" getter="get_color_map_enabled" default="true">
+			Enables the color map, which holds the color tint (RGB) and the roughness / wetness (A) of the terrain. Disabling it frees the color texture array from VRAM, skips every color map lookup in the shader, and disables the Color and Roughness painting tools. Saved region data is not changed, so the map can be enabled again without loss. At runtime, the color maps are also freed from RAM for regions that have a file on disk and no unsaved changes. They are reloaded from the file if the map is enabled again, or borrowed from it when such a region is saved, so no color data is lost.
+			A disabled color map renders the same as an unpainted one: no tint and neutral roughness / wetness. Use this to save memory on projects that don't paint color or roughness, especially on mobile devices.
+		</member>
 		<member name="color_compress_mode" type="int" setter="set_color_compress_mode" getter="get_color_compress_mode" enum="CompressMode" default="5" experimental="This feature is experimental.">
 			The selected [enum CompressMode] will be used to compress the color maps upon save, for use at runtime. Changing this will mark all of your regions as modified.
 			Maps can be saved on disk, stored in RAM, and stored in VRAM. Using this option will save both compressed and uncompressed maps on disk, optionally store one or both in RAM, and only one will be used in VRAM.

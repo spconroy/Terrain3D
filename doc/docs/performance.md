@@ -46,7 +46,7 @@ We allow you to have a non-contiguous world with discrete data blocks (regions) 
 * If you don't ever call `Terrain3DData.update_maps()`, you could also run `clear_color_map()` or `clear_compressed_color_map()` on every region at runtime to free them from RAM.
 
 Future Plans:
-* An option to disable the color map entirely is being worked on for v1.2.
+* Disable the color map. If you don't paint color, roughness, or wetness, turn off `Regions/Advanced/Color Map Enabled`. This frees the color texture array from VRAM and removes every color map lookup from the shader. The saved region data is unchanged, so you can turn it back on later. Note that roughness and wetness are stored in the color map's alpha channel, so they are disabled as well.
 * Region streaming is being worked on for v1.2 and will allow us to minimize the number of regions in VRAM at any given time.
 * 16-bit heights at runtime are being considered.
 
