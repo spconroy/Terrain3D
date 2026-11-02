@@ -118,11 +118,36 @@
 				Removes all instancer data and MultiMeshInstance nodes attached to the tree for the specified region and mesh id.
 			</description>
 		</method>
+		<method name="destroy_mmis_by_region">
+			<return type="void" />
+			<param index="0" name="region_location" type="Vector2i" />
+			<description>
+				Frees the rendering instances of a region without touching its instance data. Used when a streamed region is evicted.
+			</description>
+		</method>
 		<method name="get_closest_mesh_id" qualifiers="const">
 			<return type="int" />
 			<param index="0" name="global_position" type="Vector3" />
 			<description>
 				Returns the mesh instance ID closest to the specified global position on the ground.
+			</description>
+		</method>
+		<method name="get_mmi_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of cells that currently have rendering instances. Useful for verifying that instances follow region residency.
+			</description>
+		</method>
+		<method name="get_mmi_region_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of regions that currently have rendering instances.
+			</description>
+		</method>
+		<method name="get_mmi_region_locations" qualifiers="const">
+			<return type="Vector2i[]" />
+			<description>
+				Returns the locations of the regions that currently have rendering instances.
 			</description>
 		</method>
 		<method name="is_enabled" qualifiers="const">
