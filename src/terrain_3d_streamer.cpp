@@ -61,7 +61,7 @@ int Terrain3DStreamer::get_max_distance() const {
 // Lowers distance to what the pool can hold. A distance the slots cannot hold
 // would permanently starve loading: the pool fills, nothing beyond it ever
 // inserts, and nothing evicts, leaving holes in the world.
-void Terrain3DStreamer::_apply_distance_limit() {
+void Terrain3DStreamer::apply_distance_limit() {
 	int max_distance = get_max_distance();
 	if (_distance > max_distance) {
 		LOG(WARN, "streaming_distance ", _distance, " needs ", get_required_slots(_distance),
@@ -76,7 +76,7 @@ void Terrain3DStreamer::set_shape(const StreamShape p_shape) {
 		return;
 	}
 	_shape = p_shape;
-	_apply_distance_limit();
+	apply_distance_limit();
 }
 
 void Terrain3DStreamer::set_distance(const int p_distance) {
@@ -88,7 +88,7 @@ void Terrain3DStreamer::set_distance(const int p_distance) {
 	if (required > _slots) {
 		_slots = MIN(required, 1024);
 	}
-	_apply_distance_limit(); // Still clamps if even 1024 slots cannot hold it (square distance > 14)
+	apply_distance_limit(); // Still clamps if even 1024 slots cannot hold it (square distance > 14)
 }
 
 void Terrain3DStreamer::set_slots(const int p_slots) {
@@ -96,7 +96,7 @@ void Terrain3DStreamer::set_slots(const int p_slots) {
 	// (2 * 2 + 1)^2 = 25 regions, so a smaller pool starves even at the minimum
 	// distance. Circle needs fewer, but the square worst case is shape safe.
 	_slots = CLAMP(p_slots, 25, 1024);
-	_apply_distance_limit();
+	apply_distance_limit();
 }
 
 void Terrain3DStreamer::set_mode(const StreamMode p_mode) {

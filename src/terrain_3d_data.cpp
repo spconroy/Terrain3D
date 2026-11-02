@@ -135,6 +135,10 @@ void Terrain3DData::initialize(Terrain3D *p_terrain) {
 	LOG(INFO, "Initializing data");
 	bool prev_initialized = _terrain != nullptr;
 	_terrain = p_terrain;
+	if (!prev_initialized) {
+		_region_map_size = _terrain->get_region_map_size();
+		_region_map_origin = V2I(-_region_map_size / 2);
+	}
 	_region_map.resize(_region_map_size * _region_map_size);
 	_vertex_spacing = _terrain->get_vertex_spacing();
 	// Must be set before loading, as loading regions updates the maps and signals the collision, which divide by it

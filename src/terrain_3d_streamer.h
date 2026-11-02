@@ -61,7 +61,6 @@ private:
 	real_t _land_ms_avg = 0.f;
 
 	real_t _distance_to(const Vector2i &p_region_loc, const Vector2i &p_focus_loc) const;
-	void _apply_distance_limit();
 	void _collision_refresh(const Vector2i &p_region_loc);
 	void _flush_ram_cache();
 
@@ -83,6 +82,7 @@ public:
 	int get_slots() const { return _slots; }
 	int get_required_slots(const int p_distance) const;
 	int get_max_distance() const;
+	void apply_distance_limit();
 	void set_concurrent_loads(const int p_count) { _concurrent_loads = CLAMP(p_count, 1, 8); }
 	int get_concurrent_loads() const { return _concurrent_loads; }
 	void set_loads_per_frame(const int p_count) { _loads_per_frame = CLAMP(p_count, 1, 8); }
