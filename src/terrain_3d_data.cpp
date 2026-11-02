@@ -973,8 +973,10 @@ void Terrain3DData::calc_height_range(const bool p_recursive) {
  *	p_global_position - X,0,Z location on the region map. Valid range is +/-16 * region_size
  *	p_offset - Add this factor to all height values, can be negative
  *	p_scale - Scale all height values by this factor (applied after offset)
+ *	p_update - Rebuild the maps after importing. Set to false when importing several images in a row,
+ *		then call update_maps() once at the end.
  */
-void Terrain3DData::import_images(const TypedArray<Image> &p_images, const Vector3 &p_global_position, const real_t p_offset, const real_t p_scale) {
+void Terrain3DData::import_images(const TypedArray<Image> &p_images, const Vector3 &p_global_position, const real_t p_offset, const real_t p_scale, const bool p_update) {
 	IS_INIT_MESG("Data not initialized", VOID);
 	// Validate images and determine common size
 	if (p_images.size() != TYPE_MAX) {
@@ -1114,7 +1116,10 @@ void Terrain3DData::import_images(const TypedArray<Image> &p_images, const Vecto
 				if (img.is_valid() && !img->is_empty()) {
 					Ref<Image> region_map;
 					Ref<Image> existing_map = region->get_map(static_cast<MapType>(i));
-					if (existing_map.is_valid() && !existing_map->is_empty()) {
+					if (copy_width == _region_size && copy_height == _region_size && img->get_size() == _region_sizev) {
+						// Source covers the whole region: no need to duplicate the old map and blit over it
+						region_map = img->duplicate();
+					} else if (existing_map.is_valid() && !existing_map->is_empty()) {
 						region_map = existing_map->duplicate();
 						if (region_map->get_format() != img->get_format()) {
 							region_map->convert(img->get_format());
@@ -1133,7 +1138,9 @@ void Terrain3DData::import_images(const TypedArray<Image> &p_images, const Vecto
 			region->sanitize_maps();
 		}
 	}
-	update_maps(TYPE_MAX, true, generate_mipmaps);
+	if (p_update) {
+		update_maps(TYPE_MAX, true, generate_mipmaps);
+	}
 
 	if (_master_height_range.y - _master_height_range.x < 2.f) {
 		Ref<Image> htimg = p_images[TYPE_HEIGHT];
@@ -1488,7 +1495,7 @@ void Terrain3DData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("calc_height_range", "recursive"), &Terrain3DData::calc_height_range, DEFVAL(false));
 
 	// Utility
-	ClassDB::bind_method(D_METHOD("import_images", "images", "global_position", "offset", "scale"), &Terrain3DData::import_images, DEFVAL(V3_ZERO), DEFVAL(0.f), DEFVAL(1.f));
+	ClassDB::bind_method(D_METHOD("import_images", "images", "global_position", "offset", "scale", "update"), &Terrain3DData::import_images, DEFVAL(V3_ZERO), DEFVAL(0.f), DEFVAL(1.f), DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("export_image", "file_name", "map_type", "mode"), &Terrain3DData::export_image, DEFVAL(TYPE_HEIGHT), DEFVAL(EXPORT_SLICES));
 	ClassDB::bind_method(D_METHOD("layered_to_image", "map_type", "bounds"), &Terrain3DData::layered_to_image, DEFVAL(Rect2i()));
 	ClassDB::bind_method(D_METHOD("dump", "verbose"), &Terrain3DData::dump, DEFVAL(false));
