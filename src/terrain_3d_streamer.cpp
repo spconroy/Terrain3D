@@ -619,6 +619,7 @@ void Terrain3DStreamer::step() {
 			// Walked away while it loaded, or loaded for a spot beyond the map window or one the slot pool
 			// cannot hold yet: consume, and keep the body in RAM mode or while a keep shape still wants it
 			Ref<Terrain3DRegion> body = ResourceLoader::get_singleton()->load_threaded_get(kv.value);
+			_stat_disk_needed += (kept && (pending_want == nullptr || !pending_want->cache_only)) ? 1 : 0;
 			if (body.is_valid() && (_mode == RAM || (kept && (int)_ram_cache.size() < _keep_cache_limit))) {
 				_finish_body(body, kv.key, kv.value);
 				body->set_modified(false);
@@ -666,6 +667,7 @@ void Terrain3DStreamer::step() {
 		}
 		Ref<Terrain3DRegion> region = ResourceLoader::get_singleton()->load_threaded_get(ready[i].path);
 		_pending.erase(ready[i].loc);
+		_stat_disk_needed += 1;
 		if (region.is_null()) {
 			_resolved.erase(ready[i].loc);
 			LOG(ERROR, "Streaming load returned null region ", ready[i].loc);
@@ -846,6 +848,7 @@ Dictionary Terrain3DStreamer::get_stats() const {
 	d["deferred"] = _stat_deferred; // Wanted but the slot pool cannot hold them
 	d["outside_window"] = _stat_outside; // Wanted but beyond the region map window
 	d["collision_refreshes"] = (int64_t)_stat_collision; // Dynamic collision refreshes this streamer asked for
+	d["disk_loads_needed"] = (int64_t)_stat_disk_needed; // Threaded loads consumed for regions needed now (not cached ahead of a path's reach, not RAM cache inserts)
 	d["recentres"] = (int64_t)_stat_recentres; // Window moves so far
 	d["nearest_missing"] = _stat_nearest; // Meters to the nearest wanted region not visible yet, not behind the target, -1 if none
 	return d;

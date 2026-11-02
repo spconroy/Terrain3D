@@ -138,6 +138,7 @@ private:
 	real_t _stat_nearest = -1.f;
 	uint64_t _stat_recentres = 0;
 	uint64_t _stat_collision = 0;
+	uint64_t _stat_disk_needed = 0;
 	uint64_t _landed_total = 0; // Counters for get_stats()
 	uint64_t _evicted_total = 0;
 	real_t _land_ms_avg = 0.f;
