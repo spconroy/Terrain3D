@@ -103,15 +103,15 @@ void Terrain3DStreamer::set_mode(const StreamMode p_mode) {
 	_mode = p_mode;
 	LOG(INFO, "Streaming mode: ", p_mode == RAM ? "RAM resident" : "disk");
 	if (p_mode == DISK) {
-		// Cached bodies may carry runtime edits that DISK mode would have saved
-		// on eviction; write them back before the cache drops
+		// Cached bodies may carry runtime edits; they are written back before the cache
+		// drops only when persist_edits is on
 		_flush_ram_cache();
 	}
 	_prefetch_cursor = 0;
 }
 
-// Saves modified cached regions and drops the cache. Runs when leaving RAM mode
-// or when streaming stops, so runtime edits are never lost with the bodies.
+// Drops the cache, first saving modified regions when persist_edits is on. Runs when leaving
+// RAM mode or when streaming stops; otherwise cached runtime edits are discarded.
 void Terrain3DStreamer::_flush_ram_cache() {
 	// Only write cached edits back when the terrain opts in; by default streaming never
 	// persists on its own (see Terrain3DData::evict_region).
@@ -281,7 +281,10 @@ void Terrain3DStreamer::step() {
 		}
 		region->take_over_path(ready[i].path);
 		region->set_location(ready[i].loc);
-		region->set_version(Terrain3DData::CURRENT_DATA_VERSION);
+		// Loading runs the setters, which flag the region modified. Reset it like load_directory
+		// does; otherwise persist_edits would rewrite every region it evicts. The on disk version is
+		// left alone: streaming is read only, and a save stamps the current version itself
+		region->set_modified(false);
 		if (data->add_region_streamed(region) == OK) {
 			_collision_refresh(ready[i].loc);
 			_landed_total += 1;
@@ -346,7 +349,6 @@ void Terrain3DStreamer::step() {
 			Ref<Terrain3DRegion> region = _ram_cache[loc];
 			_ram_cache.erase(loc);
 			region->set_location(loc);
-			region->set_version(Terrain3DData::CURRENT_DATA_VERSION);
 			if (data->add_region_streamed(region) == OK) {
 				_collision_refresh(loc);
 				_landed_total += 1;
