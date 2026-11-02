@@ -70,6 +70,8 @@ func _make_terrain(spacing: float, data_dir := "") -> Terrain3D:
 	t.change_region_size(RS)
 	t.vertex_spacing = spacing
 	t.set_camera(cam)
+	if "nocol=1" in OS.get_cmdline_user_args():
+		t.collision_mode = 0 # DISABLED
 	t.assets = Terrain3DAssets.new()
 	return t
 
@@ -79,10 +81,10 @@ func imgs(i: int) -> Array[Image]:
 	return a
 
 
-func add_region(t: Terrain3D, rx: int, rz: int, i: int, spacing := 1.0) -> int:
+func add_region(t: Terrain3D, rx: int, rz: int, i: int, spacing := 1.0, update := true) -> int:
 	var im := imgs(i)
 	var t0 := Time.get_ticks_usec()
-	t.data.import_images(im, Vector3(rx * RS * spacing, 0, rz * RS * spacing), 0.0, 1.0)
+	t.data.import_images(im, Vector3(rx * RS * spacing, 0, rz * RS * spacing), 0.0, 1.0, update)
 	return Time.get_ticks_usec() - t0
 
 
@@ -206,9 +208,14 @@ func run_cost() -> void:
 
 func run_move() -> void:
 	var spread := false
+	var batch := false
 	for a in OS.get_cmdline_user_args():
 		if a == "spread=1":
 			spread = true
+		if a == "batch=1":
+			batch = true
+		if a.begins_with("reserve=") and terrain.data.has_method("reserve_region_slots"):
+			terrain.data.call("reserve_region_slots", int(a.substr(8)))
 	var speed := 500.0
 	var base_col_i := -14
 	var n := 0
@@ -246,12 +253,14 @@ func run_move() -> void:
 		while pending.size() and budget > 0:
 			var op = pending.pop_front()
 			if op[0] == "add":
-				add_region(terrain, op[1], op[2], n)
+				add_region(terrain, op[1], op[2], n, 1.0, not batch)
 				n += 1
 			else:
-				terrain.data.unload_region(Vector2i(op[1], op[2]))
+				terrain.data.unload_region(Vector2i(op[1], op[2]), not batch)
 			ops = true
 			budget -= 1
+		if ops and batch:
+			terrain.data.update_maps(Terrain3DRegion.TYPE_MAX, false, false)
 		if ops:
 			op_cost.append((Time.get_ticks_usec() - t0) / 1000.0)
 			op_frames.append(dt * 1000.0)
@@ -259,8 +268,8 @@ func run_move() -> void:
 			quiet.append(dt * 1000.0)
 	for i in 90:
 		await get_tree().process_frame
-	p("vram after 90 settle frames: %.1f MB" % vram_mb())
-	p("move mode=%s speed=%.0f m/s columns crossed=%d regions resident=%d vram %.1f -> %.1f MB" % ["spread" if spread else "burst", speed, cur - base_col_i, terrain.data.get_region_count(), vr0, vram_mb()])
+	p("vram after 90 settle frames: %.1f MB, slots %d" % [vram_mb(), terrain.data.get_region_slot_count()])
+	p("move mode=%s%s speed=%.0f m/s columns crossed=%d regions resident=%d vram %.1f -> %.1f MB" % ["spread" if spread else "burst", " batch" if batch else "", speed, cur - base_col_i, terrain.data.get_region_count(), vr0, vram_mb()])
 	p("quiet frames: n=%d median %.2f p99 %.2f max %.2f ms" % [quiet.size(), med(quiet), pct(quiet, 0.99), mx(quiet)])
 	p("frames after op frames (dt of the frame following ops): n=%d median %.2f max %.2f ms ; op cost in-frame (sum per frame) median %.2f max %.2f ms" % [op_frames.size(), med(op_frames), mx(op_frames), med(op_cost), mx(op_cost)])
 	finish()
@@ -460,4 +469,27 @@ func run_shot() -> void:
 	add_tinted(1, 1)
 	add_tinted(2, 1)
 	await shot_view("shot_d_two_after_clear")
+	finish()
+
+
+func run_ddir() -> void:
+	var dir := OUT + "ddir_data"
+	DirAccess.make_dir_recursive_absolute(dir)
+	for f in DirAccess.get_files_at(dir):
+		DirAccess.remove_absolute(dir + "/" + f)
+	for i in 4:
+		add_region(terrain, i, 0, i)
+	terrain.data.save_directory(dir)
+	terrain.queue_free()
+	await get_tree().process_frame
+	await get_tree().process_frame
+	terrain = _make_terrain(1.0)
+	await get_tree().process_frame
+	await get_tree().process_frame
+	p("before: regions %d" % terrain.data.get_region_count())
+	terrain.data_directory = dir # node already in the tree, files present
+	await get_tree().process_frame
+	await get_tree().process_frame
+	p("after setting data_directory in tree: regions %d, slots %d" % [terrain.data.get_region_count(), terrain.data.get_region_slot_count()])
+	await shot_view("ddir_after")
 	finish()

@@ -274,6 +274,12 @@
 				See [method get_region_map_index].
 			</description>
 		</method>
+		<method name="get_region_slot_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of layers allocated in the region texture arrays, including unused ones. See [method reserve_region_slots].
+			</description>
+		</method>
 		<method name="reserve_region_slots">
 			<return type="void" />
 			<param index="0" name="count" type="int" />

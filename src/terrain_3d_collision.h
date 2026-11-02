@@ -63,6 +63,7 @@ public:
 	void initialize(Terrain3D *p_terrain);
 
 	void build();
+	void rebuild_for_regions();
 	void reset_target_position() { _last_snapped_pos = V2I_MAX; }
 	void update(const Vector2i &p_region_loc = V2I_MAX, const bool p_rebuild = false);
 	void destroy();

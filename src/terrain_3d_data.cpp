@@ -1718,6 +1718,7 @@ void Terrain3DData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_regions_all"), &Terrain3DData::get_regions_all);
 	ClassDB::bind_method(D_METHOD("get_region_map"), &Terrain3DData::get_region_map);
 	ClassDB::bind_method(D_METHOD("reserve_region_slots", "count"), &Terrain3DData::reserve_region_slots);
+	ClassDB::bind_method(D_METHOD("get_region_slot_count"), &Terrain3DData::get_region_slot_count);
 	ClassDB::bind_static_method("Terrain3DData", D_METHOD("get_region_map_index", "region_location"), &Terrain3DData::get_region_map_index);
 
 	ClassDB::bind_method(D_METHOD("do_for_regions", "area", "callback"), &Terrain3DData::do_for_regions);

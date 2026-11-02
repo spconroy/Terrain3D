@@ -230,6 +230,16 @@ void Terrain3DCollision::build() {
 	update();
 }
 
+// Called when the region map changed. The dynamic game collision keeps the same shapes whichever regions exist,
+// so it only needs its shape data refreshed instead of destroying and recreating the physics body and every shape.
+void Terrain3DCollision::rebuild_for_regions() {
+	if (_initialized && _mode == DYNAMIC_GAME && _static_body_rid.is_valid()) {
+		update(V2I_MAX, true);
+	} else {
+		build();
+	}
+}
+
 void Terrain3DCollision::update(const Vector2i &p_region_loc, const bool p_rebuild) {
 	IS_INIT(VOID);
 	if (!_initialized) {

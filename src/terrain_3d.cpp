@@ -57,9 +57,9 @@ void Terrain3D::_initialize() {
 		_data->connect("region_map_changed", callable_mp(this, &Terrain3D::update_region_labels));
 	}
 	// Any region was changed, regenerate collision if enabled
-	if (!_data->is_connected("region_map_changed", callable_mp(_collision, &Terrain3DCollision::build))) {
-		LOG(DEBUG, "Connecting _data::region_map_changed signal to build()");
-		_data->connect("region_map_changed", callable_mp(_collision, &Terrain3DCollision::build));
+	if (!_data->is_connected("region_map_changed", callable_mp(_collision, &Terrain3DCollision::rebuild_for_regions))) {
+		LOG(DEBUG, "Connecting _data::region_map_changed signal to rebuild_for_regions()");
+		_data->connect("region_map_changed", callable_mp(_collision, &Terrain3DCollision::rebuild_for_regions));
 	}
 	// Any map was regenerated or regions changed, update material uniforms without rebuilding shaders
 	if (!_data->is_connected("maps_changed", callable_mp(_material.ptr(), &Terrain3DMaterial::update).bind(Terrain3DMaterial::REGION_ARRAYS))) {
@@ -612,7 +612,9 @@ void Terrain3D::set_data_directory(String p_dir) {
 	if (!old_dir.is_empty() || Util::get_files(p_dir, "terrain3d*.res").size() > 0) {
 		_initialized = false;
 		_destroy_labels();
-		_destroy_collision();
+		// Free collision completely. A kept instance still has _terrain set, so it would respond to the signals
+		// emitted while the new data loads, before the data knows its region size, and crash.
+		_destroy_collision(true);
 		_destroy_instancer();
 		memdelete_safely(_data);
 		_initialize();
