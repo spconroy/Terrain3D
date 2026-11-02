@@ -88,13 +88,10 @@ func _run() -> void:
 			if x == 0 and y == 0:
 				continue
 			DirAccess.copy_absolute(src, _dir + "/" + Terrain3DUtil.location_to_filename(Vector2i(x, y)))
-	# Files outside the 32x32 region map (-16..15) must be ignored, not streamed at a wrong
-	# location (they used to land at (0,0) and be evicted again every frame).
-	for y in range(-HALF, HALF + 1):
-		for x in [HALF, HALF + 1]:
-			DirAccess.copy_absolute(src, _dir + "/" + Terrain3DUtil.location_to_filename(Vector2i(x, y)))
-	for x in range(-HALF, HALF):
-		DirAccess.copy_absolute(src, _dir + "/" + Terrain3DUtil.location_to_filename(Vector2i(x, HALF)))
+	# Files beyond the +-(1<<20) location limit must be ignored by the scan, not streamed at a
+	# wrong location. Locations inside it (even outside the default 32x32 window) are valid.
+	for loc in [Vector2i((1 << 20) + 1, 0), Vector2i(0, -(1 << 20) - 1)]:
+		DirAccess.copy_absolute(src, _dir + "/" + Terrain3DUtil.location_to_filename(loc))
 	ok(DirAccess.get_files_at(_dir).size() > HALF * HALF * 4, "authored %d region files" % DirAccess.get_files_at(_dir).size())
 	_t.queue_free()
 	await physics_frame
@@ -112,7 +109,7 @@ func _run() -> void:
 	_t.set_clipmap_target(cam)
 	await physics_frame
 	ok(_t.data.is_streaming(), "streaming active")
-	ok(int(_t.get_streaming_stats().get("known", 0)) == HALF * HALF * 4, "scan found the whole world, ignoring out of bounds files")
+	ok(int(_t.get_streaming_stats().get("known", 0)) == HALF * HALF * 4, "scan found the whole world, ignoring files beyond the location limit")
 
 	for shape in [Terrain3DStreamer.SQUARE, Terrain3DStreamer.CIRCLE]:
 		_t.streaming_shape = shape
