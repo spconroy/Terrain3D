@@ -8,7 +8,7 @@ extends SceneTree
 var _fail := 0
 var _t: Terrain3D
 var _cam: Camera3D
-var _base := "user://cm_stream_test"
+var _base := "user://cm_stream_test_%d" % OS.get_process_id()
 var _rs := 256
 
 
