@@ -101,6 +101,9 @@ void Terrain3DData::initialize(Terrain3D *p_terrain) {
 	_terrain = p_terrain;
 	_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
 	_vertex_spacing = _terrain->get_vertex_spacing();
+	// Must be set before loading, as loading regions updates the maps and signals the collision, which divide by it
+	_region_size = _terrain->get_region_size();
+	_region_sizev = V2I(_region_size);
 	if (!prev_initialized && !_terrain->get_data_directory().is_empty()) {
 		if (_terrain->is_streaming_active()) {
 			// Nothing is loaded up front while streaming. The files own the region size,
@@ -114,8 +117,6 @@ void Terrain3DData::initialize(Terrain3D *p_terrain) {
 			load_directory(_terrain->get_data_directory());
 		}
 	}
-	_region_size = _terrain->get_region_size();
-	_region_sizev = V2I(_region_size);
 }
 
 void Terrain3DData::set_region_locations(const TypedArray<Vector2i> &p_locations) {
