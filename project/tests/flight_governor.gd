@@ -19,7 +19,12 @@ extends RefCounted
 ##   const FlightGovernor := preload("res://tests/flight_governor.gd")
 ##   var g := FlightGovernor.new()
 ##   g.setup(path_length, heights, 50.0, ground_start, ground_end)
-##   every physics frame: g.step(delta, streamer.get_path_ready_distance(path_id))
+##   every physics frame:
+##     var st := streamer.get_stats()
+##     g.observe_loader(delta, st.disk_loads_needed, st.inflight >= terrain.streaming_concurrent_loads, metres_per_load)
+##     g.step(delta, streamer.get_path_ready_distance(path_id))
+##     scale the corridor radius, cone width and lookahead with g.quality (and g.safety), blur with g.speed_fraction()
+##   metres_per_load = region size / regions in one column of the corridor at the current radius.
 ##   then place the camera at path(g.distance) with g.altitude, g.pitch and g.fov, and hold the landing
 ##   (keep hovering) until the destination is loaded: g.is_done(destination_loaded).
 ##
