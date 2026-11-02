@@ -391,7 +391,7 @@ func update_decal() -> void:
 	var r_map: PackedInt32Array = plugin.terrain.data.get_region_map()
 	if plugin.editor.get_tool() == Terrain3DEditor.REGION:
 		var r_size: float = float(plugin.terrain.get_region_size()) * plugin.terrain.get_vertex_spacing()
-		var map_size: int = plugin.terrain.data.REGION_MAP_SIZE
+		var map_size: int = plugin.terrain.data.get_region_map_size()
 		var half_r_size: float = r_size * 0.5
 		var pos: Vector2 = (Vector2(plugin.mouse_global_position.x, plugin.mouse_global_position.z) +
 			Vector2(half_r_size, half_r_size)).snappedf(r_size) - Vector2(half_r_size, half_r_size)
@@ -402,7 +402,7 @@ func update_decal() -> void:
 		editor_decal_part[1] = false # Disable reticle
 		
 		var loc: Vector2i = plugin.terrain.data.get_region_location(plugin.mouse_global_position)
-		loc += Vector2i(map_size / 2, map_size / 2)
+		loc -= plugin.terrain.data.get_region_map_origin()
 		if !(loc.x < 0 or loc.x > map_size - 1 or loc.y < 0 or loc.y > map_size - 1):
 			var index: int = clampi(loc.y * map_size + loc.x, 0, map_size * map_size - 1)
 			if plugin.terrain.material.get_world_background() == Terrain3DMaterial.WorldBackground.NONE:

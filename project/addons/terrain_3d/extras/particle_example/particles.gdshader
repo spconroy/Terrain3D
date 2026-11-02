@@ -59,7 +59,8 @@ uniform float _vertex_spacing = 1.0;
 uniform float _vertex_density = 1.0; // = 1/_vertex_spacing
 uniform float _region_size = 1024.0;
 uniform float _region_texel_size = 0.0009765625; // = 1/REGION_SIZE
-uniform int _region_map_size = 32;
+uniform int _region_map_size = 32; // Window size, a power of two
+uniform ivec2 _region_map_origin = ivec2(-16); // Region location of window cell (0,0)
 uniform int _region_map[1024];
 uniform vec2 _region_locations[MAX_REGIONS];
 uniform highp sampler2DArray _height_maps : repeat_disable;
@@ -72,7 +73,7 @@ uniform highp sampler2DArray _color_maps : repeat_disable;
 // Z: layer index used for texturearrays, -1 if not in a region
 ivec3 get_index_coord(const vec2 uv) {
 	vec2 r_uv = round(uv);
-	ivec2 pos = ivec2(floor(r_uv * _region_texel_size)) + (_region_map_size / 2);
+	ivec2 pos = ivec2(floor(r_uv * _region_texel_size)) - _region_map_origin;
 	int bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
 	int layer_index = _region_map[pos.y * _region_map_size + pos.x] * bounds - 1;
 	return ivec3(ivec2(mod(r_uv, _region_size)), layer_index);
@@ -80,7 +81,7 @@ ivec3 get_index_coord(const vec2 uv) {
 
 // Takes in UV2 region space coordinates, returns 1.0 or 0.0 if a region is present or not.
 float check_region(const vec2 uv2) {
-	ivec2 pos = ivec2(floor(uv2)) + (_region_map_size / 2);
+	ivec2 pos = ivec2(floor(uv2)) - _region_map_origin;
     int bounds = int(uint(pos.x | pos.y) < uint(_region_map_size));
     int raw_index = _region_map[pos.y * _region_map_size + pos.x] - 1;
     int is_valid = bounds * int(raw_index >= 0) * int(raw_index < MAX_REGIONS);

@@ -32,6 +32,42 @@ void Terrain3DData::_clear() {
 	_generated_color_maps.clear();
 }
 
+// True if every loaded region maps to a cell of a window of p_size at p_origin
+bool Terrain3DData::_regions_fit_window(const Vector2i &p_origin, const int p_size) const {
+	for (const Vector2i region_loc : _region_locations) {
+		const Vector2i d = region_loc - p_origin;
+		if (d.x < 0 || d.y < 0 || d.x >= p_size || d.y >= p_size) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Rewrites every cell of the region map from the loaded regions. While streaming
+// the cell holds slot + 1, otherwise the position in _region_locations + 1.
+// Regions outside the window get no cell: they are not drawn nor found by
+// get_region_id until the window covers them again.
+void Terrain3DData::_rebuild_region_map() {
+	_region_map.clear();
+	_region_map.resize(_region_map_size * _region_map_size);
+	if (_streaming) {
+		for (const KeyValue<Vector2i, int> &kv : _slot_of) {
+			const int map_index = get_region_map_index(kv.key);
+			if (map_index >= 0) {
+				_region_map[map_index] = kv.value + 1;
+			}
+		}
+	} else {
+		for (int i = 0; i < _region_locations.size(); i++) {
+			const int map_index = get_region_map_index(_region_locations[i]);
+			if (map_index >= 0) {
+				_region_map[map_index] = i + 1;
+			}
+		}
+	}
+	_region_map_dirty = false;
+}
+
 // Structured to work with do_for_regions. Should be renamed when copy_paste is expanded
 void Terrain3DData::_copy_paste_dfr(const Terrain3DRegion *p_src_region, const Rect2i &p_src_rect, const Rect2i &p_dst_rect, const Terrain3DRegion *p_dst_region) {
 	if (!p_src_region || !p_dst_region) {
@@ -117,6 +153,53 @@ void Terrain3DData::initialize(Terrain3D *p_terrain) {
 			load_directory(_terrain->get_data_directory());
 		}
 	}
+}
+
+/**
+ * Sets the region location of window cell (0,0). Region locations are not limited, but only
+ * the _region_map_size x _region_map_size regions of the window are found, rendered and editable.
+ * Streaming recentres the window on the camera. Otherwise all loaded regions must stay within it.
+ */
+void Terrain3DData::set_region_map_origin(const Vector2i &p_origin) {
+	if (p_origin == _region_map_origin) {
+		return;
+	}
+	if (ABS(p_origin.x) > Terrain3DRegion::MAX_LOCATION || ABS(p_origin.y) > Terrain3DRegion::MAX_LOCATION) {
+		LOG(ERROR, "Region map origin ", p_origin, " out of bounds. Max: ", -Terrain3DRegion::MAX_LOCATION, " to ", Terrain3DRegion::MAX_LOCATION);
+		return;
+	}
+	// While streaming, regions left outside are evicted by the streamer
+	if (!_streaming && !_regions_fit_window(p_origin, _region_map_size)) {
+		LOG(ERROR, "Loaded regions would fall outside a region map window at ", p_origin, ". Not moving it");
+		return;
+	}
+	LOG(INFO, "Setting region map origin: ", p_origin);
+	_region_map_origin = p_origin;
+	_rebuild_region_map();
+	emit_signal("region_map_changed");
+	emit_signal("maps_changed");
+}
+
+/**
+ * Sets the window size in regions, a power of two from 8 to REGION_MAP_SIZE (32). The window is
+ * centred on region (0,0) again.
+ */
+void Terrain3DData::set_region_map_size(const int p_size) {
+	const int size = CLAMP(int(Math::closest_power_of_2(uint32_t(p_size))), 8, REGION_MAP_SIZE);
+	if (size == _region_map_size) {
+		return;
+	}
+	const Vector2i origin = V2I(-size / 2);
+	if (!_streaming && !_regions_fit_window(origin, size)) {
+		LOG(ERROR, "Loaded regions do not fit a region map window of ", size, ". Not changing it");
+		return;
+	}
+	LOG(INFO, "Setting region map size: ", size);
+	_region_map_size = size;
+	_region_map_origin = origin;
+	_rebuild_region_map();
+	emit_signal("region_map_changed");
+	emit_signal("maps_changed");
 }
 
 void Terrain3DData::set_region_locations(const TypedArray<Vector2i> &p_locations) {
@@ -1603,7 +1686,9 @@ void Terrain3DData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_regions_all"), &Terrain3DData::get_regions_all);
 	ClassDB::bind_method(D_METHOD("get_region_map"), &Terrain3DData::get_region_map);
 	ClassDB::bind_method(D_METHOD("get_region_map_index", "region_location"), &Terrain3DData::get_region_map_index);
+	ClassDB::bind_method(D_METHOD("set_region_map_size", "size"), &Terrain3DData::set_region_map_size);
 	ClassDB::bind_method(D_METHOD("get_region_map_size"), &Terrain3DData::get_region_map_size);
+	ClassDB::bind_method(D_METHOD("set_region_map_origin", "origin"), &Terrain3DData::set_region_map_origin);
 	ClassDB::bind_method(D_METHOD("get_region_map_origin"), &Terrain3DData::get_region_map_origin);
 
 	ClassDB::bind_method(D_METHOD("do_for_regions", "area", "callback"), &Terrain3DData::do_for_regions);

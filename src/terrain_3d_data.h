@@ -89,6 +89,8 @@ private:
 
 	// Functions
 	void _clear();
+	bool _regions_fit_window(const Vector2i &p_origin, const int p_size) const;
+	void _rebuild_region_map();
 	void _copy_paste_dfr(const Terrain3DRegion *p_src_region, const Rect2i &p_src_rect, const Rect2i &p_dst_rect, const Terrain3DRegion *p_dst_region);
 	Error _save_export_image(const MapType p_map_type, const Ref<Image> &p_img, const String &p_path, const String &p_ext) const;
 
@@ -115,7 +117,9 @@ public:
 	Dictionary get_regions_all() const { return _regions; }
 	PackedInt32Array get_region_map() const { return _region_map; }
 	int get_region_map_index(const Vector2i &p_region_loc) const;
+	void set_region_map_size(const int p_size);
 	int get_region_map_size() const { return _region_map_size; }
+	void set_region_map_origin(const Vector2i &p_origin);
 	Vector2i get_region_map_origin() const { return _region_map_origin; }
 
 	void do_for_regions(const Rect2i &p_area, const Callable &p_callback);

@@ -715,6 +715,7 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 	}
 	RS->material_set_param(p_material, "_region_map", region_map);
 	RS->material_set_param(p_material, "_region_map_size", map_size);
+	RS->material_set_param(p_material, "_region_map_origin", data->get_region_map_origin());
 	if (Terrain3D::debug_level >= EXTREME) {
 		LOG(EXTREME, "Region map");
 		for (int i = 0; i < region_map.size(); i++) {

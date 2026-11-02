@@ -25,13 +25,14 @@ R"(
 		float __grid_d = min(__g.x, __g.y);
 		float __grid_mask = 1.0 - smoothstep(__line_thickness - fwidth(__grid_d), __line_thickness + fwidth(__grid_d), __grid_d);
 		// Region Map Boundry
-		float __hmap = _region_size * 16.0;
-		vec2 __bp = abs(__p) - __hmap;
+		float __hmap = _region_size * float(_region_map_size) * 0.5;
+		vec2 __bc = (vec2(_region_map_origin) + float(_region_map_size) * 0.5) * _region_size;
+		vec2 __bp = abs(__p - __bc) - __hmap;
 		float __box_d = abs(max(__bp.x, __bp.y));
 		float __box_mask = 1.0 - smoothstep( __line_thickness - fwidth(__box_d), __line_thickness + fwidth(__box_d), __box_d);
 		// Clip Grid at Boundary
 		float __b_line = __hmap - __line_thickness - fwidth(__box_d);
-		__grid_mask *= step(abs(__p.x), __b_line) * step(abs(__p.y), __b_line);
+		__grid_mask *= step(abs(__p.x - __bc.x), __b_line) * step(abs(__p.y - __bc.y), __b_line);
 		vec3 __grid_color = mix(__inactive_color, __active_color, float(clamp(get_index_coord(__pixel_pos.xz - 0.5).z + 1, 0, 1)));
 		ALBEDO = mix(ALBEDO, __grid_mask * __grid_color + __box_mask * __boundary_color, max(__grid_mask, __box_mask));
 	}
