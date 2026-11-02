@@ -119,6 +119,7 @@ private:
 	Vector<KeepShape> _keep; // Extra keep shapes, see add_keep_circle()
 	int _next_keep_id = 1;
 	HashSet<Vector2i> _discard; // In flight loads to drop when they land
+	bool _collision_dirty = false; // A region landed in range of the dynamic collision; refreshed once at the end of step()
 	bool _keep_dirty = false; // A shape shrank or vanished: the next step evicts to the strict union
 	int _stat_wanted = 0; // Union stats from the last step
 	int _stat_missing = 0;
@@ -140,6 +141,7 @@ private:
 	KeepShape *_find_keep(const int p_id, const KeepShape::Type p_type);
 	void _set_path(KeepShape &p_shape, const PackedVector3Array &p_points);
 	void _collision_refresh(const Vector2i &p_region_loc);
+	void _collision_flush();
 	void _retire(const Vector2i &p_region_loc, const Ref<Terrain3DRegion> &p_region, const String &p_dir);
 	void _run_retire_job(const int64_t p_job);
 	void _poll_retiring(const bool p_wait);

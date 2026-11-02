@@ -598,6 +598,7 @@ void Terrain3DStreamer::step() {
 	int io_free = _concurrent_loads - (int)_pending.size();
 	int slot_free = data->get_free_slot_count() - slot_pending;
 	if (!keep_active && MIN(io_free, slot_free) <= 0) {
+		_collision_flush();
 		return;
 	}
 	Vector<Want> cands;
@@ -671,6 +672,7 @@ void Terrain3DStreamer::step() {
 			budget--;
 		}
 	}
+	_collision_flush();
 }
 
 Dictionary Terrain3DStreamer::get_stats() const {
@@ -1187,9 +1189,6 @@ void Terrain3DStreamer::_finish_body(const Ref<Terrain3DRegion> &p_region, const
 	p_region->set_location(p_loc);
 }
 
-// A streamed insertion only matters to collision when the region can intersect the
-// dynamic window around the collision target. A forced update() refills shape data in
-// place; build() would destroy and recreate the physics body under the player.
 // A failed load may be transient (file busy, a copy still in progress), so it is requested again after a
 // delay. After FAIL_RETRIES failures, or at once if the body itself is bad, it is ignored until a rescan.
 void Terrain3DStreamer::_mark_failed(const Vector2i &p_region_loc, const bool p_give_up) {
@@ -1204,6 +1203,10 @@ bool Terrain3DStreamer::_is_failed(const Vector2i &p_region_loc) const {
 	return until != nullptr && Time::get_singleton()->get_ticks_msec() < *until;
 }
 
+// A streamed insertion only matters to collision when the region can intersect the
+// dynamic window around the collision target. A forced update() refills shape data in
+// place; build() would destroy and recreate the physics body under the player.
+// The refresh itself runs once per step, see _collision_flush().
 void Terrain3DStreamer::_collision_refresh(const Vector2i &p_region_loc) {
 	Terrain3DCollision *collision = _terrain->get_collision();
 	if (collision == nullptr || !collision->is_enabled() || !collision->is_dynamic_mode()) {
@@ -1216,6 +1219,19 @@ void Terrain3DStreamer::_collision_refresh(const Vector2i &p_region_loc) {
 	Vector2 cp = tp.clamp(rmin, rmin + Vector2(rs, rs));
 	real_t d = MAX(ABS(cp.x - tp.x), ABS(cp.y - tp.y));
 	if (d <= real_t(collision->get_radius()) + real_t(collision->get_shape_size())) {
+		_collision_dirty = true;
+	}
+}
+
+// Refreshes the dynamic collision once for every region that landed this step. A forced update
+// costs about 25 ms whatever the region size, and a region corner can touch up to four landings.
+void Terrain3DStreamer::_collision_flush() {
+	if (!_collision_dirty) {
+		return;
+	}
+	_collision_dirty = false;
+	Terrain3DCollision *collision = _terrain->get_collision();
+	if (collision != nullptr && collision->is_enabled() && collision->is_dynamic_mode()) {
 		collision->update(V2I_MAX, true);
 	}
 }
