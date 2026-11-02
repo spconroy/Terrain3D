@@ -488,7 +488,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			var wanted_list: Array = s.get_wanted_regions(false)
 			var missing := 0
 			for loc: Vector2i in wanted_list:
-				if (float(loc.x) + 0.5) * sp < pos.x - 1.5 * sp - 100.0 and not ring_keep.has(loc): # 100 m: the wanted list is one tick old
+				if (float(loc.x) + 0.5) * sp < pos.x - 1.5 * sp - 100.0 - g.speed * 0.05 and not ring_keep.has(loc): # The wanted list is a tick or two old
 					m.wanted_behind += 1
 					if m.wanted_behind <= 3:
 						print("DEBUG wanted behind: ", loc, " cam x ", pos.x / sp, " t ", t, " scale ", s.camera_scale)
