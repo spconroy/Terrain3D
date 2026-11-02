@@ -34,6 +34,25 @@ public: // Constants
 	};
 
 private:
+	// An extra area to keep loaded beside the clipmap target's own area. World units, XZ plane.
+	struct KeepShape {
+		enum Type {
+			CIRCLE,
+			PATH,
+			CONE,
+		};
+		int id = 0;
+		Type type = CIRCLE;
+		bool destination = false; // Loads before everything else
+		Vector2 point; // Circle center, cone origin
+		Vector2 dir = Vector2(0.f, -1.f); // Cone forward, unit length
+		Vector<Vector2> points; // Path polyline
+		Vector<real_t> arc; // Path: distance along the polyline at each point
+		real_t radius = 0.f; // Circle radius, path corridor radius, cone half width
+		real_t length = 0.f; // Cone extent ahead
+		real_t behind = 0.f; // Cone extent behind
+	};
+
 	Terrain3D *_terrain = nullptr;
 
 	// Public settings
@@ -45,6 +64,8 @@ private:
 	int _concurrent_loads = 3; // Threaded region loads in flight
 	int _loads_per_frame = 1; // Loaded regions inserted per physics frame
 	bool _persist_edits = false; // Write a modified region back to disk when it is evicted
+	real_t _camera_scale = 1.f; // Scales the clipmap target's own area, 0 removes it
+	int _keep_cache_limit = 128; // Regions outside the map window whose bodies may be cached
 
 	// Work data
 	Vector<Vector2i> _known; // Region locations present on disk
@@ -57,6 +78,14 @@ private:
 	Vector2 _last_focus;
 	Vector2i _focus_loc; // Region location of the clipmap target, set every step
 	bool _has_last_focus = false;
+	Vector<KeepShape> _keep; // Extra keep shapes, see add_keep_circle()
+	int _next_keep_id = 1;
+	HashSet<Vector2i> _discard; // In flight loads to drop when they land
+	bool _keep_dirty = false; // A shape shrank or vanished: the next step evicts to the strict union
+	int _stat_wanted = 0; // Union stats from the last step
+	int _stat_missing = 0;
+	int _stat_deferred = 0;
+	int _stat_outside = 0;
 	uint64_t _landed_total = 0; // Counters for get_stats()
 	uint64_t _evicted_total = 0;
 	real_t _land_ms_avg = 0.f;
@@ -64,6 +93,14 @@ private:
 	real_t _distance_to(const Vector2i &p_region_loc, const Vector2i &p_focus_loc) const;
 	bool _is_wanted(const Vector2i &p_region_loc) const;
 	bool _is_retained(const Vector2i &p_region_loc) const;
+	bool _is_kept(const Vector2i &p_region_loc, const bool p_retain) const;
+	bool _keep_active() const { return !_keep.is_empty() || _camera_scale != 1.f; }
+	real_t _region_span() const;
+	bool _shape_hit(const KeepShape &p_shape, const Vector2i &p_region_loc, const real_t p_expand, real_t *r_rank) const;
+	bool _segment_hit(const KeepShape &p_shape, const int p_index, const Vector2i &p_region_loc, const real_t p_expand, real_t *r_arc) const;
+	real_t _arc_of(const KeepShape &p_shape, const Vector2 &p_point) const;
+	KeepShape *_find_keep(const int p_id, const KeepShape::Type p_type);
+	void _set_path(KeepShape &p_shape, const PackedVector3Array &p_points);
 	void _collision_refresh(const Vector2i &p_region_loc);
 	void _flush_ram_cache();
 
@@ -92,6 +129,22 @@ public:
 	int get_loads_per_frame() const { return _loads_per_frame; }
 	void set_persist_edits(const bool p_enabled) { _persist_edits = p_enabled; }
 	bool get_persist_edits() const { return _persist_edits; }
+	void set_camera_scale(const real_t p_scale);
+	real_t get_camera_scale() const { return _camera_scale; }
+	void set_keep_cache_limit(const int p_limit) { _keep_cache_limit = CLAMP(p_limit, 0, 4096); }
+	int get_keep_cache_limit() const { return _keep_cache_limit; }
+
+	int add_keep_circle(const Vector3 &p_center, const real_t p_radius, const bool p_destination = false);
+	int add_keep_path(const PackedVector3Array &p_points, const real_t p_radius);
+	int add_keep_cone(const Vector3 &p_origin, const Vector3 &p_direction, const real_t p_length, const real_t p_half_width,
+			const real_t p_behind = 0.f, const bool p_destination = false);
+	bool set_keep_circle(const int p_id, const Vector3 &p_center, const real_t p_radius);
+	bool set_keep_path(const int p_id, const PackedVector3Array &p_points, const real_t p_radius);
+	bool set_keep_cone(const int p_id, const Vector3 &p_origin, const Vector3 &p_direction, const real_t p_length,
+			const real_t p_half_width, const real_t p_behind = 0.f);
+	void remove_keep(const int p_id);
+	void clear_keep();
+	int get_keep_count() const { return _keep.size(); }
 
 	void scan_directory();
 	void step();
