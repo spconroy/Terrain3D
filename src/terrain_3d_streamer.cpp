@@ -241,21 +241,56 @@ void Terrain3DStreamer::step() {
 	Vector3 focus = _terrain->get_clipmap_target_position();
 	Vector2i floc = data->get_region_location(focus);
 	_focus_loc = floc;
-	// Region locations are unbounded, the region map window is not. Recentre it on the
-	// focus whenever the retained area (distance + 1, see eviction below) leaves it.
-	// Regions left outside are beyond the retained area, so they evict below. Keep shapes
-	// never move the window: only the part of them inside it is inserted, the rest waits
-	// in the body cache until the window reaches it.
+	Vector2 fpos = Vector2(focus.x, focus.z);
+	_focus_pos = fpos;
+	_update_axis();
+	// Region locations are unbounded, the region map window is not. Recentre it whenever the
+	// retained area (distance + 1, see eviction below) leaves it. Regions left outside are beyond the
+	// retained area, so they evict below. Along a keep path or cone the window also slides ahead of the
+	// target: the retained area stays inside, the rest of the window reaches along the direction of
+	// travel, and it moves as soon as a region needed now lies outside, so that regions ahead take a
+	// slot with time to spare instead of only when the target arrives. Wanted regions beyond the
+	// window wait in the body cache until it reaches them.
 	const int retained = _distance + 1;
 	const Vector2i origin = data->get_region_map_origin();
 	const int window = data->get_region_map_size();
-	if (floc.x - retained < origin.x || floc.y - retained < origin.y ||
-			floc.x + retained >= origin.x + window || floc.y + retained >= origin.y + window) {
-		data->set_region_map_origin(floc - V2I(window / 2));
+	const bool escaped = floc.x - retained < origin.x || floc.y - retained < origin.y ||
+			floc.x + retained >= origin.x + window || floc.y + retained >= origin.y + window;
+	Vector2i target = floc - V2I(window / 2);
+	if (_has_axis) {
+		// Keep the retained area at the rear of the window, on the axes the direction of travel points along
+		const real_t bias = 0.3f;
+		target = floc - V2I(window / 2);
+		if (_axis.x > bias) {
+			target.x = floc.x - retained;
+		} else if (_axis.x < -bias) {
+			target.x = floc.x + retained - window + 1;
+		}
+		if (_axis.y > bias) {
+			target.y = floc.y - retained;
+		} else if (_axis.y < -bias) {
+			target.y = floc.y + retained - window + 1;
+		}
+		if (!escaped) {
+			// Move only when it brings regions needed now inside the window
+			int outside_now = 0;
+			int outside_after = 0;
+			for (int i = 0; i < _wanted_near.size(); i++) {
+				const Vector2i &w = _wanted_near[i];
+				outside_now += (w.x < origin.x || w.y < origin.y || w.x >= origin.x + window || w.y >= origin.y + window) ? 1 : 0;
+				outside_after += (w.x < target.x || w.y < target.y || w.x >= target.x + window || w.y >= target.y + window) ? 1 : 0;
+			}
+			if (outside_now == 0 || outside_after >= outside_now) {
+				target = origin;
+			}
+		}
+	}
+	if (target != origin && (escaped || _has_axis)) {
+		data->set_region_map_origin(target);
+		_stat_recentres += 1;
 	}
 	// Track the travel direction so regions ahead of travel load first on ties.
 	// A teleport (a jump beyond one region span) resets it.
-	Vector2 fpos = Vector2(focus.x, focus.z);
 	if (_has_last_focus) {
 		Vector2 delta = fpos - _last_focus;
 		real_t span = real_t((int)_terrain->get_region_size()) * _terrain->get_vertex_spacing();
@@ -267,8 +302,6 @@ void Terrain3DStreamer::step() {
 	}
 	_last_focus = fpos;
 	_has_last_focus = true;
-	_focus_pos = fpos;
-	_update_axis();
 	const bool keep_active = _keep_active();
 	const real_t span = _region_span();
 	uint64_t start_us = Time::get_singleton()->get_ticks_usec();
@@ -801,6 +834,8 @@ Dictionary Terrain3DStreamer::get_stats() const {
 	d["missing"] = _stat_missing; // Wanted, inside the map window and not resident yet
 	d["deferred"] = _stat_deferred; // Wanted but the slot pool cannot hold them
 	d["outside_window"] = _stat_outside; // Wanted but beyond the region map window
+	d["collision_refreshes"] = (int64_t)_stat_collision; // Dynamic collision refreshes this streamer asked for
+	d["recentres"] = (int64_t)_stat_recentres; // Window moves so far
 	d["nearest_missing"] = _stat_nearest; // Meters to the nearest wanted region not visible yet, not behind the target, -1 if none
 	return d;
 }
@@ -976,8 +1011,8 @@ bool Terrain3DStreamer::_segment_hit(const KeepShape &p_shape, const int p_index
 		const real_t len2 = ab.length_squared();
 		const real_t t = len2 > 0.f ? CLAMP((rmin + V2(span * 0.5f) - a).dot(ab) / len2, 0.f, 1.f) : 0.f;
 		const real_t arc = p_shape.arc[p_index] + t * Math::sqrt(len2);
-		if (_behind_limit >= 0.f && arc < p_shape.cam_arc - _behind_limit - span * 0.5f) {
-			return false; // Further behind the target than behind_limit
+		if (_behind_limit >= 0.f && p_shape.id != 0 && (arc < p_shape.cam_arc - _behind_limit - span * 0.5f || _cut_behind(p_region_loc))) {
+			return false; // Further behind the target than behind_limit, by arc or in the plane (the path's start cap)
 		}
 		if (r_arc != nullptr) {
 			*r_arc = arc;
@@ -1572,6 +1607,7 @@ void Terrain3DStreamer::_collision_flush() {
 	Terrain3DCollision *collision = _terrain->get_collision();
 	if (collision != nullptr && collision->is_enabled() && collision->is_dynamic_mode()) {
 		collision->update(V2I_MAX, true);
+		_stat_collision += 1;
 	}
 }
 
