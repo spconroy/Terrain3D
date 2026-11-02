@@ -601,19 +601,28 @@ void Terrain3DData::enable_streaming(const int p_slot_capacity) {
 	// would reject each insertion's mipmapped texture update
 	Ref<Image> blank_h = Util::get_filled_image(V2I(rs), COLOR[TYPE_HEIGHT], false, FORMAT[TYPE_HEIGHT]);
 	Ref<Image> blank_c = Util::get_filled_image(V2I(rs), COLOR[TYPE_CONTROL], false, FORMAT[TYPE_CONTROL]);
-	Ref<Image> blank_col = Util::get_filled_image(V2I(rs), COLOR[TYPE_COLOR], true, FORMAT[TYPE_COLOR]);
+	// A disabled color map allocates no color array at all
+	const bool color_enabled = _terrain->get_color_map_enabled();
+	Ref<Image> blank_col;
+	if (color_enabled) {
+		blank_col = Util::get_filled_image(V2I(rs), COLOR[TYPE_COLOR], true, FORMAT[TYPE_COLOR]);
+	}
 	TypedArray<Image> hl, cl, coll;
 	for (int i = 0; i < _slot_capacity; i++) {
 		hl.push_back(blank_h);
 		cl.push_back(blank_c);
-		coll.push_back(blank_col);
+		if (color_enabled) {
+			coll.push_back(blank_col);
+		}
 	}
 	_generated_height_maps.clear();
 	_generated_height_maps.create(hl);
 	_generated_control_maps.clear();
 	_generated_control_maps.create(cl);
 	_generated_color_maps.clear();
-	_generated_color_maps.create(coll);
+	if (color_enabled) {
+		_generated_color_maps.create(coll);
+	}
 	_region_map.clear();
 	_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
 	_region_map_dirty = false;
@@ -640,7 +649,20 @@ Error Terrain3DData::add_region_streamed(const Ref<Terrain3DRegion> &p_region) {
 	ERR_FAIL_COND_V_MSG(p_region->get_region_size() != _region_size, FAILED,
 			vformat("Streamed region %s is %d px but the pool is %d px - mixed region sizes in %s",
 					loc, p_region->get_region_size(), _region_size, _terrain != nullptr ? _terrain->get_data_directory() : String()));
-	p_region->sanitize_maps();
+	// A disabled color map is neither allocated, mipmapped nor uploaded; the region
+	// keeps whatever color data it has so a later save does not lose it
+	const bool color_enabled = _terrain != nullptr && _terrain->get_color_map_enabled();
+	// The pool's color layers are uncompressed. A region that carries only its compressed
+	// color map (no uncompressed copy) is expanded rather than replaced with a blank
+	if (color_enabled && p_region->get_color_map().is_null() && p_region->is_color_compressed()) {
+		Ref<Image> expanded = p_region->get_compressed_color_map()->duplicate();
+		if (expanded->is_compressed()) {
+			expanded->decompress();
+		}
+		expanded->convert(FORMAT[TYPE_COLOR]);
+		p_region->set_color_map(expanded);
+	}
+	p_region->sanitize_maps(color_enabled);
 	p_region->set_deleted(false);
 	int slot = _free_slots[_free_slots.size() - 1];
 	_free_slots.remove_at(_free_slots.size() - 1);
@@ -653,7 +675,7 @@ Error Terrain3DData::add_region_streamed(const Ref<Terrain3DRegion> &p_region) {
 	_region_map[map_index] = slot + 1;
 	_generated_height_maps.update(p_region->get_height_map(), slot);
 	_generated_control_maps.update(p_region->get_control_map(), slot);
-	if (p_region->get_color_map().is_valid()) {
+	if (color_enabled && p_region->get_color_map().is_valid()) {
 		_generated_color_maps.update(p_region->get_color_map(), slot);
 	}
 	calc_height_range();

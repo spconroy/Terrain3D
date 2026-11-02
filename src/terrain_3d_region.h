@@ -94,7 +94,7 @@ public:
 	bool is_color_compressed() const { return _compressed_color_map.is_valid(); }
 	void compress_color_map(const CompressMode p_compress_mode);
 	void check_compressed_color_map(const CompressMode p_compress_mode);
-	void sanitize_maps();
+	void sanitize_maps(const bool p_color = true);
 	Ref<Image> sanitize_map(const MapType p_map_type, const Ref<Image> &p_map) const;
 	bool validate_map_size(const Ref<Image> &p_map) const;
 

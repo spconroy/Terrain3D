@@ -696,7 +696,12 @@ void Terrain3D::set_color_map_enabled(const bool p_enabled) {
 		return;
 	}
 	// Rebuild or free the color texture array
-	_data->update_maps(TYPE_COLOR, true, _color_map_enabled);
+	if (is_streaming_active() && !IS_EDITOR) {
+		// The pooled color array exists at capacity or not at all, so rebuild the pool
+		_reinit_streaming_pool();
+	} else {
+		_data->update_maps(TYPE_COLOR, true, _color_map_enabled);
+	}
 	if (_material.is_valid()) {
 		// Recompile shader with / without NO_COLOR_MAP and rebind the arrays
 		_material->update(Terrain3DMaterial::FULL_REBUILD);
