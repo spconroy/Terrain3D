@@ -69,6 +69,16 @@ private:
 		int64_t task = -1;
 	};
 
+	// Optional location -> {path, rotation, mirror, read_only} override, called on the main thread
+	Callable _resolver;
+	struct Resolved {
+		int rotation = 0;
+		bool mirror = false;
+		bool read_only = false;
+	};
+	HashMap<Vector2i, Resolved> _resolved; // Pending locations that used the resolver
+	HashSet<Vector2i> _virtual; // Locations registered without a file of their own
+
 	// Work data
 	Vector<Vector2i> _known; // Region locations present on disk
 	HashSet<Vector2i> _known_set;
@@ -101,6 +111,8 @@ private:
 	void _flush_ram_cache();
 	void _mark_failed(const Vector2i &p_region_loc, const bool p_give_up = false);
 	bool _is_failed(const Vector2i &p_region_loc) const;
+	Error _request_load(const Vector2i &p_loc, const String &p_dir);
+	void _finish_body(const Ref<Terrain3DRegion> &p_region, const Vector2i &p_loc, const String &p_path);
 
 public:
 	Terrain3DStreamer() {}
@@ -129,6 +141,11 @@ public:
 	bool get_persist_edits() const { return _persist_edits; }
 	void set_frame_budget_ms(const real_t p_ms) { _frame_budget_ms = CLAMP(p_ms, 0.f, 50.f); }
 	real_t get_frame_budget_ms() const { return _frame_budget_ms; }
+
+	void set_resolver(const Callable &p_resolver);
+	Callable get_resolver() const { return _resolver; }
+	void register_virtual_locations(const TypedArray<Vector2i> &p_locations);
+	void clear_virtual_locations();
 
 	void scan_directory();
 	void step();

@@ -15,6 +15,12 @@
 				Consumes and drops every in flight threaded load. An unconsumed threaded load stays pinned in the ResourceLoader forever, so this runs whenever streaming stops: rescans, disabling streaming at runtime, and leaving the tree.
 			</description>
 		</method>
+		<method name="clear_virtual_locations">
+			<return type="void" />
+			<description>
+				Forgets every location added with [method register_virtual_locations] and rescans the data directory.
+			</description>
+		</method>
 		<method name="get_max_distance" qualifiers="const">
 			<return type="int" />
 			<description>
@@ -38,6 +44,13 @@
 			<return type="bool" />
 			<description>
 				Returns [code skip-lint]true[/code] when streaming is enabled and the game is running outside the editor.
+			</description>
+		</method>
+		<method name="register_virtual_locations">
+			<return type="void" />
+			<param index="0" name="locations" type="Array[Vector2i]" />
+			<description>
+				Makes locations known to the streamer that have no file in the data directory, so a [member resolver] can supply them. They stream like any other location. A virtual location the resolver does not answer for is looked up as the normal file name, fails to load and is marked failed. Registered locations survive [method scan_directory].
 			</description>
 		</method>
 		<method name="scan_directory">
@@ -80,6 +93,11 @@
 		<member name="persist_edits" type="bool" setter="set_persist_edits" getter="get_persist_edits" default="false">
 			Whether a region modified at runtime is written back to the data directory when it is evicted (and, in RAM mode, when the cache is flushed by leaving RAM mode or disabling streaming). The write happens on a worker thread, so it does not stall the frame; the region is not reloaded until its file is complete. Off by default: streaming is a read-only view of the data on disk, so eviction drops the region together with its runtime edits and a revisit reloads the on-disk version. In RAM mode the edits survive eviction in the cache until it is flushed. Turn it on for a world that should persist runtime edits; otherwise save explicitly with [method Terrain3DData.save_directory]. Note that persisting can overwrite an edit made to the same region file by another process while the region was resident.
 			Alias target of [member Terrain3D.streaming_persist_edits].
+		</member>
+		<member name="resolver" type="Callable" setter="set_resolver" getter="get_resolver" default="Callable()">
+			Optional hook that lets several locations share one region file (a tile library with reuse). Signature: [code skip-lint]func(location: Vector2i) -> Dictionary[/code]. Return [code skip-lint]{"path": String, "rotation": int, "mirror": bool, "read_only": bool}[/code]; only [code skip-lint]path[/code] is required. [code skip-lint]rotation[/code] is 0-3 clockwise quarter turns, applied after [code skip-lint]mirror[/code] (a flip of the x axis). They are applied to the height, control and color maps; control map pixels move whole, so the packed texture ids stay exact. The loaded region is placed at the requested location, not the file's own.
+			An empty Dictionary or an empty [code skip-lint]path[/code] means the normal file for the location, so with no resolver nothing changes. The resolver is called on the main thread each time the streamer requests a location, never on a loader thread: keep it fast, such as a Dictionary lookup. The mirror and rotation also run on the main thread, right before insertion, because ResourceLoader's threaded load has no hook for loader thread code. Locations that share a file load one at a time.
+			[code skip-lint]read_only[/code] regions are never written to disk: [member persist_edits] skips them, [method Terrain3DRegion.save] refuses them. Their modified flag may still be set; it is ignored. A runtime edit to one is kept while the region stays resident and is discarded on eviction (in RAM mode, while the body stays cached); the shared file is never changed. Promoting an edited reused region to a file of its own is not implemented. Use [method register_virtual_locations] for locations without a file.
 		</member>
 		<member name="shape" type="int" setter="set_shape" getter="get_shape" enum="Terrain3DStreamer.StreamShape" default="0">
 			The shape of the loaded area around the clipmap target: a square block or a circle of radius [member distance]. A circle loads ~21% fewer regions at the same distance.

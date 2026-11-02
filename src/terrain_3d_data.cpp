@@ -830,7 +830,7 @@ Error Terrain3DData::evict_region(const Vector2i &p_region_loc, const String &p_
 	// writing it back. A modified region is only saved when the terrain opts in through
 	// streaming_persist_edits; otherwise persist explicitly with save_directory/save_region.
 	bool persist = _terrain != nullptr && _terrain->get_streaming_persist_edits();
-	if (region.is_valid() && persist && region->is_modified() && !p_save_dir.is_empty()) {
+	if (region.is_valid() && persist && region->is_modified() && !region->is_read_only() && !p_save_dir.is_empty()) {
 		save_region(p_region_loc, p_save_dir, _terrain != nullptr && _terrain->get_save_16_bit());
 	}
 	int slot = _slot_of[p_region_loc];

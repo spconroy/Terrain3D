@@ -77,6 +77,12 @@
 				Returns true if the compressed color map is valid.
 			</description>
 		</method>
+		<method name="is_read_only" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns true if this region is read only. A read only region holds data reused from a shared file (see [member Terrain3DStreamer.resolver]), so [method save] refuses to write it.
+			</description>
+		</method>
 		<method name="sanitize_map" qualifiers="const">
 			<return type="Image" />
 			<param index="0" name="map_type" type="int" enum="Terrain3DRegion.MapType" />
@@ -117,6 +123,13 @@
 			<param index="1" name="map" type="Image" />
 			<description>
 				Assigns the provided map to the desired map type.
+			</description>
+		</method>
+		<method name="set_read_only">
+			<return type="void" />
+			<param index="0" name="read_only" type="bool" />
+			<description>
+				Marks this region read only, so it is never written to disk. Not saved with the region.
 			</description>
 		</method>
 		<method name="set_maps">

@@ -121,7 +121,7 @@ void Terrain3DStreamer::_flush_ram_cache() {
 	// persists on its own (see Terrain3DData::evict_region).
 	if (_terrain != nullptr && _persist_edits && !_terrain->get_data_directory().is_empty()) {
 		for (const KeyValue<Vector2i, Ref<Terrain3DRegion>> &kv : _ram_cache) {
-			if (kv.value.is_valid() && kv.value->is_modified()) {
+			if (kv.value.is_valid() && kv.value->is_modified() && !kv.value->is_read_only()) {
 				String path = _terrain->get_data_directory() + String("/") + Util::location_to_filename(kv.key);
 				kv.value->save(path, _terrain->get_save_16_bit());
 			}
@@ -142,10 +142,39 @@ void Terrain3DStreamer::abort_pending() {
 		ResourceLoader::get_singleton()->load_threaded_get(kv.value);
 	}
 	_pending.clear();
+	_resolved.clear();
 	// Staged regions hold pool slots of the data being torn down or rebuilt
 	_staged.clear();
 	_staged_set.clear();
 	_poll_retiring(true);
+}
+
+// The resolver maps a region location to the file that provides it, so several locations
+// can share one file: Callable(location: Vector2i) -> Dictionary {path: String,
+// rotation: int 0-3 clockwise quarter turns, mirror: bool, read_only: bool}. An empty
+// Dictionary or an empty path means the normal file for the location. It is called on
+// the main thread each time the streamer requests a location; keep it fast.
+void Terrain3DStreamer::set_resolver(const Callable &p_resolver) {
+	_resolver = p_resolver;
+}
+
+// Makes locations known to the streamer without a file in the data directory. They are
+// loaded through the resolver; a virtual location with no resolver result fails like a
+// missing file. Survives scan_directory().
+void Terrain3DStreamer::register_virtual_locations(const TypedArray<Vector2i> &p_locations) {
+	for (int i = 0; i < p_locations.size(); i++) {
+		Vector2i loc = p_locations[i];
+		_virtual.insert(loc);
+		if (!_known_set.has(loc)) {
+			_known.push_back(loc);
+			_known_set.insert(loc);
+		}
+	}
+}
+
+void Terrain3DStreamer::clear_virtual_locations() {
+	_virtual.clear();
+	scan_directory();
 }
 
 // Scans the data directory for region locations. Only file names are read, nothing is loaded.
@@ -155,6 +184,7 @@ void Terrain3DStreamer::scan_directory() {
 	_known_set.clear();
 	_failed.clear();
 	_fail_count.clear();
+	_resolved.clear();
 	abort_pending();
 	_flush_ram_cache();
 	_prefetch_cursor = 0;
@@ -163,6 +193,10 @@ void Terrain3DStreamer::scan_directory() {
 	_landed_total = 0;
 	_evicted_total = 0;
 	_land_ms_avg = 0.f;
+	for (const Vector2i &loc : _virtual) {
+		_known.push_back(loc);
+		_known_set.insert(loc);
+	}
 	String dir = _terrain->get_data_directory();
 	if (dir.is_empty()) {
 		return;
@@ -178,8 +212,10 @@ void Terrain3DStreamer::scan_directory() {
 			LOG(WARN, "Streaming scan: ignoring ", fname, ", location ", loc, " is outside the world");
 			continue;
 		}
-		_known.push_back(loc);
-		_known_set.insert(loc);
+		if (!_known_set.has(loc)) {
+			_known.push_back(loc);
+			_known_set.insert(loc);
+		}
 	}
 	LOG(INFO, "Streaming scan: ", _known.size(), " regions on disk at ", dir);
 }
@@ -291,6 +327,7 @@ void Terrain3DStreamer::step() {
 			// only report the old failure instead of reading the file again
 			ResourceLoader::get_singleton()->load_threaded_get(kv.value);
 			_mark_failed(kv.key);
+			_resolved.erase(kv.key);
 			drop.push_back(kv.key);
 			continue;
 		}
@@ -299,10 +336,10 @@ void Terrain3DStreamer::step() {
 			// Walked away while it loaded: consume, and in RAM mode keep the body
 			Ref<Terrain3DRegion> body = ResourceLoader::get_singleton()->load_threaded_get(kv.value);
 			if (_mode == RAM && body.is_valid()) {
-				body->take_over_path(kv.value);
-				body->set_location(kv.key);
+				_finish_body(body, kv.key, kv.value);
 				_ram_cache[kv.key] = body;
 			}
+			_resolved.erase(kv.key);
 			drop.push_back(kv.key);
 			continue;
 		}
@@ -329,12 +366,13 @@ void Terrain3DStreamer::step() {
 		Ref<Terrain3DRegion> region = ResourceLoader::get_singleton()->load_threaded_get(ready[i].path);
 		_pending.erase(ready[i].loc);
 		if (region.is_null()) {
+			_resolved.erase(ready[i].loc);
 			LOG(ERROR, "Streaming load returned null region ", ready[i].loc);
 			_mark_failed(ready[i].loc);
 			continue;
 		}
-		region->take_over_path(ready[i].path);
-		region->set_location(ready[i].loc);
+		_finish_body(region, ready[i].loc, ready[i].path);
+		_resolved.erase(ready[i].loc);
 		// Loading runs the setters, which flag the region modified. Reset it like load_directory
 		// does; otherwise persist_edits would rewrite every region it evicts. The on disk version is
 		// left alone: streaming is read only, and a save stamps the current version itself
@@ -403,15 +441,14 @@ void Terrain3DStreamer::step() {
 			}
 			continue;
 		}
-		String path = dir + String("/") + Util::location_to_filename(loc);
-		Error err = ResourceLoader::get_singleton()->load_threaded_request(
-				path, "Terrain3DRegion", false, ResourceLoader::CACHE_MODE_IGNORE);
+		Error err = _request_load(loc, dir);
+		if (err == ERR_BUSY) {
+			continue; // A shared file is already loading for another location
+		}
 		if (err != OK) {
-			LOG(ERROR, "Streaming load request failed for ", path, ": ", err);
 			_mark_failed(loc);
 			continue;
 		}
-		_pending[loc] = path;
 		budget--;
 	}
 	// RAM mode: spend leftover load budget prefetching the rest of the world into
@@ -423,14 +460,15 @@ void Terrain3DStreamer::step() {
 			if (data->has_region(loc) || _ram_cache.has(loc) || _is_failed(loc) || _pending.has(loc) || _staged_set.has(loc)) {
 				continue;
 			}
-			String path = dir + String("/") + Util::location_to_filename(loc);
-			Error err = ResourceLoader::get_singleton()->load_threaded_request(
-					path, "Terrain3DRegion", false, ResourceLoader::CACHE_MODE_IGNORE);
+			Error err = _request_load(loc, dir);
+			if (err == ERR_BUSY) {
+				_prefetch_cursor--; // Retry once the shared file has landed
+				break;
+			}
 			if (err != OK) {
 				_mark_failed(loc);
 				continue;
 			}
-			_pending[loc] = path;
 			budget--;
 		}
 	}
@@ -474,7 +512,7 @@ void Terrain3DStreamer::_retire(const Vector2i &p_region_loc, const Ref<Terrain3
 	RetireJob *job = memnew(RetireJob);
 	job->region = p_region;
 	job->loc = p_region_loc;
-	if (_persist_edits && !p_dir.is_empty() && p_region->is_modified()) {
+	if (_persist_edits && !p_dir.is_empty() && p_region->is_modified() && !p_region->is_read_only()) {
 		job->path = p_dir + String("/") + Util::location_to_filename(p_region_loc);
 		job->save_16_bit = _terrain->get_save_16_bit();
 		_saving.insert(p_region_loc);
@@ -590,6 +628,60 @@ void Terrain3DStreamer::_advance_staged(Terrain3DData *p_data, const uint64_t p_
 	}
 }
 
+// Starts a threaded load for a location, asking the resolver (if set) which file to use.
+// Returns ERR_BUSY if the file is already loading for another location: a threaded load
+// can be consumed only once, so shared files load one location at a time.
+Error Terrain3DStreamer::_request_load(const Vector2i &p_loc, const String &p_dir) {
+	String path = p_dir + String("/") + Util::location_to_filename(p_loc);
+	Resolved info;
+	bool has_info = false;
+	if (_resolver.is_valid()) {
+		Variant result = _resolver.call(p_loc);
+		Dictionary dict = result.get_type() == Variant::DICTIONARY ? Dictionary(result) : Dictionary();
+		String rpath = dict.get("path", String());
+		if (!rpath.is_empty()) {
+			path = rpath;
+			info.rotation = int(dict.get("rotation", 0)) & 3;
+			info.mirror = bool(dict.get("mirror", false));
+			info.read_only = bool(dict.get("read_only", false));
+			has_info = true;
+		}
+	}
+	for (const KeyValue<Vector2i, String> &kv : _pending) {
+		if (kv.value == path) {
+			return ERR_BUSY;
+		}
+	}
+	Error err = ResourceLoader::get_singleton()->load_threaded_request(
+			path, "Terrain3DRegion", false, ResourceLoader::CACHE_MODE_IGNORE);
+	if (err != OK) {
+		LOG(ERROR, "Streaming load request failed for ", path, ": ", err);
+		return err;
+	}
+	_pending[p_loc] = path;
+	if (has_info) {
+		_resolved[p_loc] = info;
+	}
+	return OK;
+}
+
+// Prepares a loaded body for insertion at its requested location. Resolved bodies get
+// their mirror and rotation here, on the main thread: ResourceLoader's threaded load
+// offers no hook to run code on the loader thread.
+void Terrain3DStreamer::_finish_body(const Ref<Terrain3DRegion> &p_region, const Vector2i &p_loc, const String &p_path) {
+	if (_resolved.has(p_loc)) {
+		const Resolved &info = _resolved[p_loc];
+		p_region->transform_maps(info.rotation, info.mirror);
+		p_region->set_read_only(info.read_only);
+		if (!info.read_only) {
+			p_region->take_over_path(p_path);
+		}
+	} else {
+		p_region->take_over_path(p_path);
+	}
+	p_region->set_location(p_loc);
+}
+
 // A streamed insertion only matters to collision when the region can intersect the
 // dynamic window around the collision target. A forced update() refills shape data in
 // place; build() would destroy and recreate the physics body under the player.
@@ -651,6 +743,10 @@ void Terrain3DStreamer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_loads_per_frame"), &Terrain3DStreamer::get_loads_per_frame);
 	ClassDB::bind_method(D_METHOD("set_persist_edits", "enabled"), &Terrain3DStreamer::set_persist_edits);
 	ClassDB::bind_method(D_METHOD("get_persist_edits"), &Terrain3DStreamer::get_persist_edits);
+	ClassDB::bind_method(D_METHOD("set_resolver", "resolver"), &Terrain3DStreamer::set_resolver);
+	ClassDB::bind_method(D_METHOD("get_resolver"), &Terrain3DStreamer::get_resolver);
+	ClassDB::bind_method(D_METHOD("register_virtual_locations", "locations"), &Terrain3DStreamer::register_virtual_locations);
+	ClassDB::bind_method(D_METHOD("clear_virtual_locations"), &Terrain3DStreamer::clear_virtual_locations);
 	ClassDB::bind_method(D_METHOD("get_required_slots", "distance"), &Terrain3DStreamer::get_required_slots);
 	ClassDB::bind_method(D_METHOD("get_max_distance"), &Terrain3DStreamer::get_max_distance);
 	ClassDB::bind_method(D_METHOD("scan_directory"), &Terrain3DStreamer::scan_directory);
@@ -665,5 +761,6 @@ void Terrain3DStreamer::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "distance", PROPERTY_HINT_RANGE, "1,15,1"), "set_distance", "get_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "concurrent_loads", PROPERTY_HINT_RANGE, "1,8,1"), "set_concurrent_loads", "get_concurrent_loads");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "loads_per_frame", PROPERTY_HINT_RANGE, "1,8,1"), "set_loads_per_frame", "get_loads_per_frame");
+	ADD_PROPERTY(PropertyInfo(Variant::CALLABLE, "resolver", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_resolver", "get_resolver");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "persist_edits"), "set_persist_edits", "get_persist_edits");
 }
