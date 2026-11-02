@@ -28,6 +28,9 @@ public: // Constants
 		CIRCLE,
 	};
 
+	static inline const int FAIL_RETRIES = 3; // A failing location is requested this many times, then ignored until a rescan
+	static inline const uint64_t FAIL_RETRY_MSEC = 5000; // Wait between requests of a failed location
+
 	enum StreamMode {
 		DISK, // RAM and GPU follow the loaded area; evicted regions save and drop
 		RAM, // Region bodies stay cached in RAM; only the GPU layers follow
@@ -49,7 +52,8 @@ private:
 	// Work data
 	Vector<Vector2i> _known; // Region locations present on disk
 	HashSet<Vector2i> _known_set;
-	HashSet<Vector2i> _failed; // Corrupt or unreadable on disk, never retried
+	HashMap<Vector2i, uint64_t> _failed; // Failed loads, location -> msec time it may be requested again
+	HashMap<Vector2i, int> _fail_count; // Failures per location, a location is given up on after FAIL_RETRIES
 	HashMap<Vector2i, String> _pending; // In flight threaded loads, location -> path
 	HashMap<Vector2i, Ref<Terrain3DRegion>> _ram_cache; // RAM mode: evicted bodies, plus prefetched ones
 	int _prefetch_cursor = 0; // RAM mode: background walk of _known filling the cache
@@ -64,6 +68,8 @@ private:
 	void _apply_distance_limit();
 	void _collision_refresh(const Vector2i &p_region_loc);
 	void _flush_ram_cache();
+	void _mark_failed(const Vector2i &p_region_loc, const bool p_give_up = false);
+	bool _is_failed(const Vector2i &p_region_loc) const;
 
 public:
 	Terrain3DStreamer() {}

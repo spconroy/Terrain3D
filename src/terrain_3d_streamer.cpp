@@ -146,6 +146,7 @@ void Terrain3DStreamer::scan_directory() {
 	_known.clear();
 	_known_set.clear();
 	_failed.clear();
+	_fail_count.clear();
 	abort_pending();
 	_flush_ram_cache();
 	_prefetch_cursor = 0;
@@ -240,7 +241,10 @@ void Terrain3DStreamer::step() {
 		}
 		if (status != ResourceLoader::THREAD_LOAD_LOADED) {
 			LOG(ERROR, "Streaming load failed for region ", kv.key, " at ", kv.value);
-			_failed.insert(kv.key);
+			// Consume the failed task. The loader pins it otherwise, and a later request for the path would
+			// only report the old failure instead of reading the file again
+			ResourceLoader::get_singleton()->load_threaded_get(kv.value);
+			_mark_failed(kv.key);
 			drop.push_back(kv.key);
 			continue;
 		}
@@ -276,7 +280,7 @@ void Terrain3DStreamer::step() {
 		_pending.erase(ready[i].loc);
 		if (region.is_null()) {
 			LOG(ERROR, "Streaming load returned null region ", ready[i].loc);
-			_failed.insert(ready[i].loc);
+			_mark_failed(ready[i].loc);
 			continue;
 		}
 		region->take_over_path(ready[i].path);
@@ -294,7 +298,7 @@ void Terrain3DStreamer::step() {
 		} else if (data->get_free_slot_count() > 0) {
 			// Rejected with a slot available means the body itself is bad. Never
 			// re-request it, pool pressure alone retries fine
-			_failed.insert(ready[i].loc);
+			_mark_failed(ready[i].loc, true);
 		}
 	}
 	// Request missing regions within the loaded area, nearest first with ties broken
@@ -322,7 +326,7 @@ void Terrain3DStreamer::step() {
 		for (int dx = -_distance; dx <= _distance; dx++) {
 			Vector2i loc = floc + Vector2i(dx, dy);
 			if (!_known_set.has(loc) || data->has_region(loc) ||
-					_failed.has(loc) || _pending.has(loc)) {
+					_is_failed(loc) || _pending.has(loc)) {
 				continue;
 			}
 			real_t d = _distance_to(loc, floc);
@@ -363,7 +367,7 @@ void Terrain3DStreamer::step() {
 				path, "Terrain3DRegion", false, ResourceLoader::CACHE_MODE_IGNORE);
 		if (err != OK) {
 			LOG(ERROR, "Streaming load request failed for ", path, ": ", err);
-			_failed.insert(loc);
+			_mark_failed(loc);
 			continue;
 		}
 		_pending[loc] = path;
@@ -375,14 +379,14 @@ void Terrain3DStreamer::step() {
 		while (budget > 0 && _prefetch_cursor < _known.size()) {
 			Vector2i loc = _known[_prefetch_cursor];
 			_prefetch_cursor++;
-			if (data->has_region(loc) || _ram_cache.has(loc) || _failed.has(loc) || _pending.has(loc)) {
+			if (data->has_region(loc) || _ram_cache.has(loc) || _is_failed(loc) || _pending.has(loc)) {
 				continue;
 			}
 			String path = dir + String("/") + Util::location_to_filename(loc);
 			Error err = ResourceLoader::get_singleton()->load_threaded_request(
 					path, "Terrain3DRegion", false, ResourceLoader::CACHE_MODE_IGNORE);
 			if (err != OK) {
-				_failed.insert(loc);
+				_mark_failed(loc);
 				continue;
 			}
 			_pending[loc] = path;
@@ -424,6 +428,20 @@ real_t Terrain3DStreamer::_distance_to(const Vector2i &p_region_loc, const Vecto
 // A streamed insertion only matters to collision when the region can intersect the
 // dynamic window around the collision target. A forced update() refills shape data in
 // place; build() would destroy and recreate the physics body under the player.
+// A failed load may be transient (file busy, a copy still in progress), so it is requested again after a
+// delay. After FAIL_RETRIES failures, or at once if the body itself is bad, it is ignored until a rescan.
+void Terrain3DStreamer::_mark_failed(const Vector2i &p_region_loc, const bool p_give_up) {
+	int count = _fail_count.has(p_region_loc) ? _fail_count[p_region_loc] + 1 : 1;
+	_fail_count[p_region_loc] = count;
+	bool permanent = p_give_up || count >= FAIL_RETRIES;
+	_failed[p_region_loc] = permanent ? UINT64_MAX : Time::get_singleton()->get_ticks_msec() + FAIL_RETRY_MSEC;
+}
+
+bool Terrain3DStreamer::_is_failed(const Vector2i &p_region_loc) const {
+	const uint64_t *until = _failed.getptr(p_region_loc);
+	return until != nullptr && Time::get_singleton()->get_ticks_msec() < *until;
+}
+
 void Terrain3DStreamer::_collision_refresh(const Vector2i &p_region_loc) {
 	Terrain3DCollision *collision = _terrain->get_collision();
 	if (collision == nullptr || !collision->is_enabled() || !collision->is_dynamic_mode()) {
@@ -470,6 +488,9 @@ void Terrain3DStreamer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_persist_edits"), &Terrain3DStreamer::get_persist_edits);
 	ClassDB::bind_method(D_METHOD("get_required_slots", "distance"), &Terrain3DStreamer::get_required_slots);
 	ClassDB::bind_method(D_METHOD("get_max_distance"), &Terrain3DStreamer::get_max_distance);
+	ClassDB::bind_method(D_METHOD("scan_directory"), &Terrain3DStreamer::scan_directory);
+	ClassDB::bind_method(D_METHOD("abort_pending"), &Terrain3DStreamer::abort_pending);
+	ClassDB::bind_method(D_METHOD("step"), &Terrain3DStreamer::step);
 	ClassDB::bind_method(D_METHOD("get_stats"), &Terrain3DStreamer::get_stats);
 
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "enabled"), "set_enabled", "is_enabled");
