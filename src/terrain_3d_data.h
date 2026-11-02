@@ -108,6 +108,11 @@ public:
 	Error reserve_region_streamed(const Ref<Terrain3DRegion> &p_region, int &r_slot);
 	void upload_region_streamed(const Ref<Terrain3DRegion> &p_region, const int p_slot, const MapType p_map_type);
 	Error commit_region_streamed(const Ref<Terrain3DRegion> &p_region, const int p_slot);
+	// SCRATCH (batching bench): coalesced commit and microbench entry point
+	Error commit_regions_streamed(const Vector<Ref<Terrain3DRegion>> &p_regions, const Vector<int> &p_slots);
+	Dictionary bench_insert(const TypedArray<Terrain3DRegion> &p_bodies, const int p_batch, const bool p_coalesce);
+	static inline uint64_t _bench_us[16] = {};
+	static inline uint64_t _bench_last[8] = {};
 	void release_slot_streamed(const int p_slot) { _free_slots.push_back(p_slot); }
 	Error evict_region(const Vector2i &p_region_loc, const String &p_save_dir);
 	// Slot indexed while streaming, the dense id ordered list classically

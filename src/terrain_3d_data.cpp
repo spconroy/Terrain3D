@@ -6,6 +6,7 @@
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/resource_saver.hpp>
+#include <godot_cpp/classes/time.hpp>
 
 #include "logger.h"
 #include "terrain_3d_data.h"
@@ -706,6 +707,8 @@ void Terrain3DData::upload_region_streamed(const Ref<Terrain3DRegion> &p_region,
 
 // Step 3: makes the uploaded region resident and visible
 Error Terrain3DData::commit_region_streamed(const Ref<Terrain3DRegion> &p_region, const int p_slot) {
+	Time *T = Time::get_singleton();
+	uint64_t t0 = T->get_ticks_usec();
 	Vector2i loc = p_region->get_location();
 	int map_index = get_region_map_index(loc);
 	ERR_FAIL_COND_V_MSG(map_index < 0, FAILED, "Region location out of bounds");
@@ -716,21 +719,125 @@ Error Terrain3DData::commit_region_streamed(const Ref<Terrain3DRegion> &p_region
 		_region_locations.push_back(loc);
 	}
 	_region_map[map_index] = p_slot + 1;
+	uint64_t t1 = T->get_ticks_usec();
 	calc_height_range();
-	// Consumers follow signals: the material re-sends the region map and slot
-	// locations (the array RIDs never change), and height_maps_changed refreshes the
-	// mesher AABBs. The pool starts blank with a flat height range, so without that
-	// signal every inserted region keeps under-ground AABBs that get culled
+	uint64_t t2 = T->get_ticks_usec();
 	emit_signal("region_map_changed");
+	uint64_t t3 = T->get_ticks_usec();
 	emit_signal("maps_changed");
+	uint64_t t4 = T->get_ticks_usec();
 	emit_signal("height_maps_changed");
-	// Per region MMI build only. A rebuild (third argument true) queues a
-	// destroy and rebuild of every instance in the world, which turns each
-	// insertion into a global hitch on instanced terrains
+	uint64_t t5 = T->get_ticks_usec();
 	if (_terrain != nullptr && _terrain->get_instancer() != nullptr) {
 		_terrain->get_instancer()->update_mmis(-1, loc, false);
 	}
+	uint64_t t6 = T->get_ticks_usec();
+	_bench_us[4] += t1 - t0; // state
+	_bench_us[5] += t2 - t1; // calc_height_range
+	_bench_us[6] += t3 - t2; // region_map_changed
+	_bench_us[7] += t4 - t3; // maps_changed (material)
+	_bench_us[8] += t5 - t4; // height_maps_changed (mesher aabbs)
+	_bench_us[9] += t6 - t5; // instancer
+	_bench_us[10] += 1; // commit calls
+	_bench_us[11] += 1; // regions committed
+	_bench_last[0] = t1 - t0; _bench_last[1] = t2 - t1; _bench_last[2] = t3 - t2; _bench_last[3] = t4 - t3; _bench_last[4] = t5 - t4; _bench_last[5] = t6 - t5;
 	return OK;
+}
+
+// SCRATCH: commits several uploaded regions with one set of signals
+Error Terrain3DData::commit_regions_streamed(const Vector<Ref<Terrain3DRegion>> &p_regions, const Vector<int> &p_slots) {
+	if (p_regions.size() == 1) {
+		return commit_region_streamed(p_regions[0], p_slots[0]);
+	}
+	Time *T = Time::get_singleton();
+	uint64_t t0 = T->get_ticks_usec();
+	for (int i = 0; i < p_regions.size(); i++) {
+		Vector2i loc = p_regions[i]->get_location();
+		int map_index = get_region_map_index(loc);
+		ERR_FAIL_COND_V_MSG(map_index < 0, FAILED, "Region location out of bounds");
+		_slot_of[loc] = p_slots[i];
+		_slot_locs[p_slots[i]] = loc;
+		_regions[loc] = p_regions[i];
+		if (!_region_locations.has(loc)) {
+			_region_locations.push_back(loc);
+		}
+		_region_map[map_index] = p_slots[i] + 1;
+	}
+	uint64_t t1 = T->get_ticks_usec();
+	calc_height_range();
+	uint64_t t2 = T->get_ticks_usec();
+	emit_signal("region_map_changed");
+	uint64_t t3 = T->get_ticks_usec();
+	emit_signal("maps_changed");
+	uint64_t t4 = T->get_ticks_usec();
+	emit_signal("height_maps_changed");
+	uint64_t t5 = T->get_ticks_usec();
+	if (_terrain != nullptr && _terrain->get_instancer() != nullptr) {
+		for (int i = 0; i < p_regions.size(); i++) {
+			_terrain->get_instancer()->update_mmis(-1, p_regions[i]->get_location(), false);
+		}
+	}
+	uint64_t t6 = T->get_ticks_usec();
+	_bench_us[4] += t1 - t0;
+	_bench_us[5] += t2 - t1;
+	_bench_us[6] += t3 - t2;
+	_bench_us[7] += t4 - t3;
+	_bench_us[8] += t5 - t4;
+	_bench_us[9] += t6 - t5;
+	_bench_us[10] += 1;
+	_bench_us[11] += p_regions.size();
+	_bench_last[0] = t1 - t0; _bench_last[1] = t2 - t1; _bench_last[2] = t3 - t2; _bench_last[3] = t4 - t3; _bench_last[4] = t5 - t4; _bench_last[5] = t6 - t5;
+	return OK;
+}
+
+// SCRATCH: inserts the bodies (locations already set, not resident) in groups of p_batch, timing the phases
+Dictionary Terrain3DData::bench_insert(const TypedArray<Terrain3DRegion> &p_bodies, const int p_batch, const bool p_coalesce) {
+	Time *T = Time::get_singleton();
+	for (int i = 0; i < 16; i++) {
+		_bench_us[i] = 0;
+	}
+	PackedFloat32Array group_ms;
+	int n = p_bodies.size();
+	for (int g = 0; g < n; g += p_batch) {
+		int e = MIN(n, g + p_batch);
+		uint64_t gs = T->get_ticks_usec();
+		Vector<Ref<Terrain3DRegion>> regs;
+		Vector<int> slots;
+		for (int i = g; i < e; i++) {
+			Ref<Terrain3DRegion> r = p_bodies[i];
+			int slot = -1;
+			uint64_t a = T->get_ticks_usec();
+			reserve_region_streamed(r, slot);
+			uint64_t b = T->get_ticks_usec();
+			upload_region_streamed(r, slot, TYPE_HEIGHT);
+			uint64_t c = T->get_ticks_usec();
+			upload_region_streamed(r, slot, TYPE_CONTROL);
+			uint64_t d = T->get_ticks_usec();
+			upload_region_streamed(r, slot, TYPE_COLOR);
+			uint64_t f = T->get_ticks_usec();
+			_bench_us[0] += b - a; // reserve
+			_bench_us[1] += c - b; // height
+			_bench_us[2] += d - c; // control
+			_bench_us[3] += f - d; // color
+			if (p_coalesce) {
+				regs.push_back(r);
+				slots.push_back(slot);
+			} else {
+				commit_region_streamed(r, slot);
+			}
+		}
+		if (p_coalesce) {
+			commit_regions_streamed(regs, slots);
+		}
+		group_ms.push_back(real_t(T->get_ticks_usec() - gs) * 0.001f);
+	}
+	Dictionary d;
+	d["group_ms"] = group_ms;
+	Array names = Array::make("reserve", "up_height", "up_control", "up_color", "c_state", "c_height_range", "c_sig_region_map", "c_sig_maps", "c_sig_height", "c_instancer", "commit_calls", "commit_regions");
+	for (int i = 0; i < names.size(); i++) {
+		d[names[i]] = double(_bench_us[i]) * (i < 10 ? 0.001 : 1.0);
+	}
+	return d;
 }
 
 Error Terrain3DData::evict_region(const Vector2i &p_region_loc, const String &p_save_dir) {
@@ -1710,6 +1817,7 @@ void Terrain3DData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_free_slot_count"), &Terrain3DData::get_free_slot_count);
 	ClassDB::bind_method(D_METHOD("add_region_streamed", "region"), &Terrain3DData::add_region_streamed);
 	ClassDB::bind_method(D_METHOD("evict_region", "region_location", "save_directory"), &Terrain3DData::evict_region);
+	ClassDB::bind_method(D_METHOD("bench_insert", "bodies", "batch", "coalesce"), &Terrain3DData::bench_insert);
 
 	ClassDB::bind_method(D_METHOD("get_height_maps"), &Terrain3DData::get_height_maps);
 	ClassDB::bind_method(D_METHOD("get_control_maps"), &Terrain3DData::get_control_maps);

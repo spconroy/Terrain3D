@@ -189,6 +189,15 @@ void Terrain3DStreamer::scan_directory() {
 // loads_per_frame whole regions when the budget is 0), since the texture layer
 // uploads and signal cascade are the main thread cost that hitches.
 void Terrain3DStreamer::step() {
+	uint64_t s0 = Time::get_singleton()->get_ticks_usec();
+	_tick_upload_us = 0;
+	_tick_reserve_us = 0;
+	_tick_land_us = 0;
+	_step_impl();
+	_last_step_us = Time::get_singleton()->get_ticks_usec() - s0;
+}
+
+void Terrain3DStreamer::_step_impl() {
 	IS_INIT(VOID);
 	Terrain3DData *data = _terrain->get_data();
 	if (data == nullptr || !data->is_streaming()) {
@@ -309,11 +318,13 @@ void Terrain3DStreamer::step() {
 	ready.sort_custom<LandingSort>();
 	int inserted = 0;
 	bool worked = false;
+	_ready_left = ready.size();
 	_advance_staged(data, start_us, worked); // Finish a region begun on an earlier frame first
 	for (int i = 0; i < ready.size(); i++) {
 		if (!_can_insert(inserted, worked, start_us)) {
 			break;
 		}
+		_ready_left = ready.size() - i - 1;
 		Ref<Terrain3DRegion> region = ResourceLoader::get_singleton()->load_threaded_get(ready[i].path);
 		_pending.erase(ready[i].loc);
 		if (region.is_null()) {
@@ -440,6 +451,11 @@ Dictionary Terrain3DStreamer::get_stats() const {
 	d["land_ms_avg"] = _land_ms_avg;
 	d["staged"] = (int)_staged.size();
 	d["saving"] = (int)_saving.size();
+	d["commits_total"] = (int64_t)_commits_total;
+	d["last_commit_us"] = Array::make((int64_t)Terrain3DData::_bench_last[0], (int64_t)Terrain3DData::_bench_last[1], (int64_t)Terrain3DData::_bench_last[2], (int64_t)Terrain3DData::_bench_last[3], (int64_t)Terrain3DData::_bench_last[4], (int64_t)Terrain3DData::_bench_last[5]);
+	d["last_commit_total_us"] = (int64_t)_last_commit_total_us;
+	d["last_step_us"] = (int64_t)_last_step_us;
+	d["tick_parts_us"] = Array::make((int64_t)_tick_upload_us, (int64_t)_tick_reserve_us, (int64_t)_tick_land_us);
 	return d;
 }
 
@@ -510,7 +526,7 @@ bool Terrain3DStreamer::_budget_spent(const uint64_t p_start_us) const {
 // lasts, otherwise up to loads_per_frame per frame
 bool Terrain3DStreamer::_can_insert(const int p_inserted, const bool p_worked, const uint64_t p_start_us) const {
 	if (_frame_budget_ms > 0.f) {
-		return _staged.is_empty() && !(p_worked && _budget_spent(p_start_us));
+		return _staged.size() < _bench_batch && !(p_worked && _budget_spent(p_start_us));
 	}
 	return p_inserted < _loads_per_frame;
 }
@@ -529,7 +545,7 @@ void Terrain3DStreamer::_land(const Vector2i &p_region_loc, const real_t p_ms) {
 bool Terrain3DStreamer::_insert(Terrain3DData *p_data, const Ref<Terrain3DRegion> &p_region, const uint64_t p_start_us, bool &r_worked) {
 	uint64_t t0 = Time::get_singleton()->get_ticks_usec();
 	Vector2i loc = p_region->get_location();
-	if (_frame_budget_ms <= 0.f) {
+	if (_frame_budget_ms <= 0.f && _bench_batch <= 1) {
 		if (p_data->add_region_streamed(p_region) != OK) {
 			return false;
 		}
@@ -539,7 +555,9 @@ bool Terrain3DStreamer::_insert(Terrain3DData *p_data, const Ref<Terrain3DRegion
 	}
 	Staged staged;
 	staged.region = p_region;
-	if (p_data->reserve_region_streamed(p_region, staged.slot) != OK) {
+	Error rerr = p_data->reserve_region_streamed(p_region, staged.slot);
+	_tick_reserve_us += Time::get_singleton()->get_ticks_usec() - t0;
+	if (rerr != OK) {
 		return false;
 	}
 	if (staged.slot < 0) {
@@ -561,18 +579,45 @@ void Terrain3DStreamer::_advance_staged(Terrain3DData *p_data, const uint64_t p_
 			return;
 		}
 		uint64_t t0 = Time::get_singleton()->get_ticks_usec();
-		Staged &s = _staged.write[0];
-		Vector2i loc = s.region->get_location();
-		if (s.step < TYPE_MAX) {
+		int next = -1;
+		for (int i = 0; i < _staged.size(); i++) {
+			if (_staged[i].step < TYPE_MAX) {
+				next = i;
+				break;
+			}
+		}
+		if (next >= 0) {
+			Staged &s = _staged.write[next];
 			p_data->upload_region_streamed(s.region, s.slot, MapType(s.step));
+			_tick_upload_us += Time::get_singleton()->get_ticks_usec() - t0;
 			s.step += 1;
 			s.ms += real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f;
 		} else {
-			if (p_data->commit_region_streamed(s.region, s.slot) == OK) {
-				_land(loc, s.ms + real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f);
+			// Everything staged is uploaded. Wait for a full batch while more loaded bodies are queued
+			if (_staged.size() < _bench_batch && _ready_left > 0) {
+				return;
 			}
-			_staged_set.erase(loc);
-			_staged.remove_at(0);
+			Vector<Ref<Terrain3DRegion>> regs;
+			Vector<int> slots;
+			real_t ms = 0.f;
+			for (int i = 0; i < _staged.size(); i++) {
+				regs.push_back(_staged[i].region);
+				slots.push_back(_staged[i].slot);
+				ms = MAX(ms, _staged[i].ms);
+			}
+			Error cerr = p_data->commit_regions_streamed(regs, slots);
+			_last_commit_total_us = Time::get_singleton()->get_ticks_usec() - t0;
+			if (cerr == OK) {
+				_commits_total += 1;
+				real_t each = ms + real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f;
+				uint64_t l0 = Time::get_singleton()->get_ticks_usec();
+				_land_batch(regs, each);
+				_tick_land_us += Time::get_singleton()->get_ticks_usec() - l0;
+			}
+			for (int i = 0; i < regs.size(); i++) {
+				_staged_set.erase(regs[i]->get_location());
+			}
+			_staged.clear();
 		}
 		r_worked = true;
 	}
@@ -595,10 +640,10 @@ bool Terrain3DStreamer::_is_failed(const Vector2i &p_region_loc) const {
 	return until != nullptr && Time::get_singleton()->get_ticks_msec() < *until;
 }
 
-void Terrain3DStreamer::_collision_refresh(const Vector2i &p_region_loc) {
+bool Terrain3DStreamer::_collision_intersects(const Vector2i &p_region_loc) {
 	Terrain3DCollision *collision = _terrain->get_collision();
 	if (collision == nullptr || !collision->is_enabled() || !collision->is_dynamic_mode()) {
-		return;
+		return false;
 	}
 	Vector3 t = _terrain->get_collision_target_position();
 	Vector2 tp = Vector2(t.x, t.z) / _terrain->get_vertex_spacing(); // Descaled, like the window grid
@@ -606,8 +651,35 @@ void Terrain3DStreamer::_collision_refresh(const Vector2i &p_region_loc) {
 	Vector2 rmin = Vector2(p_region_loc) * rs;
 	Vector2 cp = tp.clamp(rmin, rmin + Vector2(rs, rs));
 	real_t d = MAX(ABS(cp.x - tp.x), ABS(cp.y - tp.y));
-	if (d <= real_t(collision->get_radius()) + real_t(collision->get_shape_size())) {
-		collision->update(V2I_MAX, true);
+	return d <= real_t(collision->get_radius()) + real_t(collision->get_shape_size());
+}
+
+void Terrain3DStreamer::_collision_refresh(const Vector2i &p_region_loc) {
+	if (_collision_intersects(p_region_loc)) {
+		_terrain->get_collision()->update(V2I_MAX, true);
+	}
+}
+
+// SCRATCH: bookkeeping for a batch of regions made resident together, one collision refresh for all
+void Terrain3DStreamer::_land_batch(const Vector<Ref<Terrain3DRegion>> &p_regions, const real_t p_ms) {
+	if (p_regions.size() == 1 || !_bench_coalesce_collision) {
+		for (int i = 0; i < p_regions.size(); i++) {
+			_land(p_regions[i]->get_location(), p_ms);
+		}
+		return;
+	}
+	uint64_t t0 = Time::get_singleton()->get_ticks_usec();
+	bool refresh = false;
+	for (int i = 0; i < p_regions.size(); i++) {
+		refresh = refresh || _collision_intersects(p_regions[i]->get_location());
+	}
+	if (refresh) {
+		_terrain->get_collision()->update(V2I_MAX, true);
+	}
+	real_t ms = p_ms + real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f;
+	for (int i = 0; i < p_regions.size(); i++) {
+		_landed_total += 1;
+		_land_ms_avg = _land_ms_avg == 0.f ? ms : _land_ms_avg * 0.9f + ms * 0.1f;
 	}
 }
 
@@ -637,6 +709,9 @@ void Terrain3DStreamer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_concurrent_loads"), &Terrain3DStreamer::get_concurrent_loads);
 	ClassDB::bind_method(D_METHOD("set_loads_per_frame", "count"), &Terrain3DStreamer::set_loads_per_frame);
 	ClassDB::bind_method(D_METHOD("get_loads_per_frame"), &Terrain3DStreamer::get_loads_per_frame);
+	ClassDB::bind_method(D_METHOD("set_bench_batch", "n"), &Terrain3DStreamer::set_bench_batch);
+	ClassDB::bind_method(D_METHOD("get_bench_batch"), &Terrain3DStreamer::get_bench_batch);
+	ClassDB::bind_method(D_METHOD("set_bench_coalesce_collision", "on"), &Terrain3DStreamer::set_bench_coalesce_collision);
 	ClassDB::bind_method(D_METHOD("set_persist_edits", "enabled"), &Terrain3DStreamer::set_persist_edits);
 	ClassDB::bind_method(D_METHOD("get_persist_edits"), &Terrain3DStreamer::get_persist_edits);
 	ClassDB::bind_method(D_METHOD("get_required_slots", "distance"), &Terrain3DStreamer::get_required_slots);

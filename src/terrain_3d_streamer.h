@@ -87,10 +87,22 @@ private:
 	uint64_t _landed_total = 0; // Counters for get_stats()
 	uint64_t _evicted_total = 0;
 	real_t _land_ms_avg = 0.f;
+	int _bench_batch = 1; // SCRATCH: regions committed together
+	int _ready_left = 0; // SCRATCH: loaded regions not yet staged this frame
+	uint64_t _commits_total = 0;
+	uint64_t _last_commit_total_us = 0;
+	uint64_t _last_step_us = 0;
+	uint64_t _tick_upload_us = 0;
+	uint64_t _tick_reserve_us = 0;
+	uint64_t _tick_land_us = 0;
+	void _step_impl();
 
 	real_t _distance_to(const Vector2i &p_region_loc, const Vector2i &p_focus_loc) const;
 	void _apply_distance_limit();
 	void _collision_refresh(const Vector2i &p_region_loc);
+	bool _collision_intersects(const Vector2i &p_region_loc);
+	void _land_batch(const Vector<Ref<Terrain3DRegion>> &p_regions, const real_t p_ms);
+	bool _bench_coalesce_collision = true;
 	void _retire(const Vector2i &p_region_loc, const Ref<Terrain3DRegion> &p_region, const String &p_dir);
 	void _run_retire_job(const int64_t p_job);
 	void _poll_retiring(const bool p_wait);
@@ -121,10 +133,13 @@ public:
 	int get_slots() const { return _slots; }
 	int get_required_slots(const int p_distance) const;
 	int get_max_distance() const;
-	void set_concurrent_loads(const int p_count) { _concurrent_loads = CLAMP(p_count, 1, 8); }
+	void set_concurrent_loads(const int p_count) { _concurrent_loads = CLAMP(p_count, 1, 64); }
 	int get_concurrent_loads() const { return _concurrent_loads; }
-	void set_loads_per_frame(const int p_count) { _loads_per_frame = CLAMP(p_count, 1, 8); }
+	void set_loads_per_frame(const int p_count) { _loads_per_frame = CLAMP(p_count, 1, 64); }
 	int get_loads_per_frame() const { return _loads_per_frame; }
+	void set_bench_batch(const int p_n) { _bench_batch = CLAMP(p_n, 1, 64); }
+	int get_bench_batch() const { return _bench_batch; }
+	void set_bench_coalesce_collision(const bool p_on) { _bench_coalesce_collision = p_on; }
 	void set_persist_edits(const bool p_enabled) { _persist_edits = p_enabled; }
 	bool get_persist_edits() const { return _persist_edits; }
 	void set_frame_budget_ms(const real_t p_ms) { _frame_budget_ms = CLAMP(p_ms, 0.f, 50.f); }
