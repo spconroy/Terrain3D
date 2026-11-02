@@ -6,7 +6,7 @@ var _per := 0
 var _extra := 0 # cells added by the test to region (0,0)
 var _done := false
 var _t: Terrain3D
-var _dir := "user://stream_inst_test_data"
+var _dir := "user://stream_inst_test_data_%d" % OS.get_process_id()
 const COUNT := 20
 
 
@@ -18,9 +18,9 @@ func ok(c: bool, m: String) -> void:
 
 func _initialize() -> void:
 	var d := DirAccess.open("user://")
-	if d != null and d.dir_exists("stream_inst_test_data"):
+	if d != null and d.dir_exists(_dir.get_file()):
 		for f in DirAccess.get_files_at(_dir):
-			d.remove("stream_inst_test_data/" + f)
+			d.remove(_dir.get_file() + "/" + f)
 	else:
 		DirAccess.make_dir_recursive_absolute(_dir)
 	_t = Terrain3D.new()
