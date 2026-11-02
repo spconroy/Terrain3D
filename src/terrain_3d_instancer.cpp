@@ -396,6 +396,24 @@ void Terrain3DInstancer::destroy_mmis_by_region(const Vector2i &p_region_loc) {
 	}
 }
 
+int Terrain3DInstancer::get_mmi_count() const {
+	int n = 0;
+	for (const KeyValue<Vector2i, MeshMMIDict> &r : _mmi_rids) {
+		for (const KeyValue<Vector2i, CellMMIDict> &m : r.value) {
+			n += (int)m.value.size();
+		}
+	}
+	return n;
+}
+
+TypedArray<Vector2i> Terrain3DInstancer::get_mmi_region_locations() const {
+	TypedArray<Vector2i> locs;
+	for (const KeyValue<Vector2i, MeshMMIDict> &kv : _mmi_rids) {
+		locs.push_back(kv.key);
+	}
+	return locs;
+}
+
 void Terrain3DInstancer::_destroy_mmi_by_location(const Vector2i &p_region_loc, const int p_mesh_id) {
 	LOG(DEBUG, "Deleting all MMIs in region: ", p_region_loc, " for mesh_id: ", p_mesh_id);
 	// Identify cells with matching mesh_id
@@ -1394,6 +1412,8 @@ void Terrain3DInstancer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("remove_instances", "global_position", "params"), &Terrain3DInstancer::remove_instances);
 	ClassDB::bind_method(D_METHOD("destroy_mmis_by_region", "region_location"), &Terrain3DInstancer::destroy_mmis_by_region);
 	ClassDB::bind_method(D_METHOD("get_mmi_region_count"), &Terrain3DInstancer::get_mmi_region_count);
+	ClassDB::bind_method(D_METHOD("get_mmi_count"), &Terrain3DInstancer::get_mmi_count);
+	ClassDB::bind_method(D_METHOD("get_mmi_region_locations"), &Terrain3DInstancer::get_mmi_region_locations);
 	ClassDB::bind_method(D_METHOD("add_multimesh", "mesh_id", "multimesh", "transform", "update"), &Terrain3DInstancer::add_multimesh, DEFVAL(Transform3D()), DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("add_transforms", "mesh_id", "transforms", "colors", "update"), &Terrain3DInstancer::add_transforms, DEFVAL(PackedColorArray()), DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("append_location", "region_location", "mesh_id", "transforms", "colors", "update"), &Terrain3DInstancer::append_location, DEFVAL(true));

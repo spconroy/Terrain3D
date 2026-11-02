@@ -76,6 +76,8 @@ public:
 	void destroy();
 	void destroy_mmis_by_region(const Vector2i &p_region_loc);
 	int get_mmi_region_count() const { return (int)_mmi_rids.size(); }
+	int get_mmi_count() const;
+	TypedArray<Vector2i> get_mmi_region_locations() const;
 
 	void clear_by_mesh(const int p_mesh_id);
 	void clear_by_location(const Vector2i &p_region_loc, const int p_mesh_id);
