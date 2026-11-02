@@ -227,6 +227,8 @@ public:
 	int get_streaming_loads_per_frame() const { return _streamer ? _streamer->get_loads_per_frame() : 1; }
 	void set_streaming_persist_edits(const bool p_enabled) { _streamer ? _streamer->set_persist_edits(p_enabled) : void(); }
 	bool get_streaming_persist_edits() const { return _streamer ? _streamer->get_persist_edits() : false; }
+	void set_streaming_frame_budget_ms(const real_t p_ms) { _streamer ? _streamer->set_frame_budget_ms(p_ms) : void(); }
+	real_t get_streaming_frame_budget_ms() const { return _streamer ? _streamer->get_frame_budget_ms() : 2.f; }
 	Dictionary get_streaming_stats() const { return _streamer ? _streamer->get_stats() : Dictionary(); }
 
 	// Collision Aliases

@@ -40,7 +40,8 @@ func _settle(max_frames: int) -> void:
 		# renderer would - a no-op when nothing is queued.
 		RenderingServer.emit_signal("frame_pre_draw")
 		var n: int = _t.data.get_region_count()
-		if n == last:
+		var st: Dictionary = _t.get_streaming_stats()
+		if n == last and int(st.get("inflight", 0)) == 0 and int(st.get("staged", 0)) == 0 and int(st.get("saving", 0)) == 0:
 			stable += 1
 			if stable >= 15:
 				return
@@ -233,6 +234,65 @@ func _run() -> void:
 	for y in range(0, 3):
 		for x in range(0, 3):
 			ok(_t.data.has_region(Vector2i(x, y)), "live budgets: ring region (%d,%d) present" % [x, y])
+
+	# Frame budget: insertion is split into steps, the minimum being one step per frame.
+	# A tiny budget stretches an insertion over many frames; the ring must still fill,
+	# slots must balance, and abandoned or interrupted insertions must not leak a slot.
+	ok(is_equal_approx(_t.streaming_frame_budget_ms, 2.0), "budget: default is 2 ms (%.1f)" % _t.streaming_frame_budget_ms)
+	_t.streaming_loads_per_frame = 1
+	_t.streaming_concurrent_loads = 3
+	_t.streaming_frame_budget_ms = 0.01
+	cam.global_position = Vector3(rs * -0.5, 50, rs * -0.5)
+	await _settle(600)
+	for y in range(-2, 1):
+		for x in range(-2, 1):
+			ok(_t.data.has_region(Vector2i(x, y)), "budget: stepped ring region (%d,%d) present" % [x, y])
+	var hb: float = _t.data.get_height(Vector3(rs * -0.5, 0, rs * -0.5))
+	ok(absf(hb - 4.0) < 0.01, "budget: stepped insertion uploaded the right heights (%.1f)" % hb)
+	ok(int(_t.get_streaming_stats().get("staged", -1)) == 0, "budget: nothing left staged")
+	ok(_t.data.get_free_slot_count() + _t.data.get_region_count() == _t.data.get_slot_capacity(), "budget: slots balance (%d+%d of %d)" % [
+			_t.data.get_free_slot_count(), _t.data.get_region_count(), _t.data.get_slot_capacity()])
+	# Teleport while insertions are mid-flight: staged regions that fell out of range
+	# are dropped and their slots returned.
+	for i in range(8):
+		cam.global_position = Vector3(rs * (6.5 if i % 2 == 0 else 0.5), 50, rs * 0.5)
+		for f in range(6):
+			await physics_frame
+	cam.global_position = Vector3(rs * 0.5, 50, rs * 0.5)
+	await _settle(600)
+	ok(_t.data.get_region_count() == 9, "budget: ring settled after interrupted insertions (%d)" % _t.data.get_region_count())
+	ok(int(_t.get_streaming_stats().get("staged", -1)) == 0, "budget: nothing left staged after teleports")
+	ok(_t.data.get_free_slot_count() + _t.data.get_region_count() == _t.data.get_slot_capacity(), "budget: no slot leaked by interruption (%d+%d of %d)" % [
+			_t.data.get_free_slot_count(), _t.data.get_region_count(), _t.data.get_slot_capacity()])
+	# Toggle live mid-insertion: to the whole-region path, and back; then streaming off and on.
+	cam.global_position = Vector3(rs * 1.5, 50, rs * 1.5)
+	for f in range(6):
+		await physics_frame
+	_t.streaming_frame_budget_ms = 0.0
+	await _settle(600)
+	ok(_t.data.has_region(Vector2i(2, 2)), "budget: 0 finishes in flight work and loads whole regions")
+	ok(int(_t.get_streaming_stats().get("staged", -1)) == 0, "budget: 0 leaves nothing staged")
+	_t.streaming_frame_budget_ms = 0.01
+	cam.global_position = Vector3(rs * -0.5, 50, rs * 0.5)
+	for f in range(6):
+		await physics_frame
+	_t.streaming_enabled = false
+	await _settle(400)
+	_t.streaming_enabled = true
+	await _settle(600)
+	ok(_t.data.is_streaming() and _t.data.get_region_count() == 9, "budget: streaming off and on mid-insertion (%d)" % _t.data.get_region_count())
+	ok(_t.data.get_free_slot_count() + _t.data.get_region_count() == _t.data.get_slot_capacity(), "budget: slots balance after toggle (%d+%d of %d)" % [
+			_t.data.get_free_slot_count(), _t.data.get_region_count(), _t.data.get_slot_capacity()])
+	# The instancer builds under the same budget: updates left over wait for later frames
+	# but must all arrive.
+	for f in range(120):
+		if _t.instancer.get_mmi_region_count() == _t.data.get_region_count():
+			break
+		await process_frame
+		RenderingServer.emit_signal("frame_pre_draw")
+	ok(_t.instancer.get_mmi_region_count() == _t.data.get_region_count(),
+			"budget: deferred instancer builds caught up (%d/%d)" % [_t.instancer.get_mmi_region_count(), _t.data.get_region_count()])
+	_t.streaming_frame_budget_ms = 2.0
 
 	# Capacity guard, both ways. Raising distance grows the pool to fit rather than
 	# starving loading (the "distance 15 loses regions" report); lowering slots

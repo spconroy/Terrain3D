@@ -2,6 +2,7 @@
 
 #include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/classes/worker_thread_pool.hpp>
 
 #include "logger.h"
 #include "terrain_3d.h"
@@ -138,6 +139,10 @@ void Terrain3DStreamer::abort_pending() {
 		ResourceLoader::get_singleton()->load_threaded_get(kv.value);
 	}
 	_pending.clear();
+	// Staged regions hold pool slots of the data being torn down or rebuilt
+	_staged.clear();
+	_staged_set.clear();
+	_poll_retiring(true);
 }
 
 // Scans the data directory for region locations. Only file names are read, nothing is loaded.
@@ -180,8 +185,9 @@ void Terrain3DStreamer::scan_directory() {
 // Runs the streaming state machine once per physics frame: evict regions that fell
 // outside the loaded area, insert completed loads, and request missing regions.
 // IO runs wide (concurrent_loads threaded loads decompress at once) while
-// insertions stay narrow (loads_per_frame per physics frame), since the texture
-// layer uploads and signal cascade are the main thread cost that hitches.
+// insertions stay narrow (frame_budget_ms of main thread time per physics frame, or
+// loads_per_frame whole regions when the budget is 0), since the texture layer
+// uploads and signal cascade are the main thread cost that hitches.
 void Terrain3DStreamer::step() {
 	IS_INIT(VOID);
 	Terrain3DData *data = _terrain->get_data();
@@ -205,6 +211,8 @@ void Terrain3DStreamer::step() {
 	}
 	_last_focus = fpos;
 	_has_last_focus = true;
+	uint64_t start_us = Time::get_singleton()->get_ticks_usec();
+	_poll_retiring(false);
 	// Evict regions beyond the loaded area plus one region of hysteresis, up to 8 per
 	// frame so a teleport frees the whole stale area quickly without starving the pool
 	TypedArray<Vector2i> loaded = data->get_region_locations();
@@ -216,6 +224,9 @@ void Terrain3DStreamer::step() {
 		}
 	}
 	for (int i = 0; i < stale.size() && i < 8; i++) {
+		if (i > 0 && _budget_spent(start_us)) {
+			break;
+		}
 		if (_mode == RAM) {
 			// Keep the body: eviction only frees the GPU slot, the region parks in
 			// the cache with any runtime edits intact and reinserts without disk IO
@@ -225,9 +236,26 @@ void Terrain3DStreamer::step() {
 				_ram_cache[stale[i]] = body;
 			}
 		} else {
-			data->evict_region(stale[i], dir);
+			// A worker thread writes a modified body (persist_edits) and frees it
+			Ref<Terrain3DRegion> body = data->get_region(stale[i]);
+			data->evict_region(stale[i], String());
+			if (body.is_valid()) {
+				_retire(stale[i], body, dir);
+			}
 		}
 		_evicted_total += 1;
+	}
+	// Drop staged regions that fell out of range before they became visible
+	for (int i = _staged.size() - 1; i >= 0; i--) {
+		Vector2i loc = _staged[i].region->get_location();
+		if (_distance_to(loc, floc) > real_t(_distance + 1)) {
+			if (_mode == RAM) {
+				_ram_cache[loc] = _staged[i].region;
+			}
+			data->release_slot_streamed(_staged[i].slot);
+			_staged_set.erase(loc);
+			_staged.remove_at(i);
+		}
 	}
 	// Poll in flight loads. Failures are marked and never retried, loads that fell out
 	// of range while loading are consumed and dropped, and the nearest completed
@@ -280,8 +308,12 @@ void Terrain3DStreamer::step() {
 	};
 	ready.sort_custom<LandingSort>();
 	int inserted = 0;
-	for (int i = 0; i < ready.size() && i < _loads_per_frame; i++) {
-		uint64_t t0 = Time::get_singleton()->get_ticks_usec();
+	bool worked = false;
+	_advance_staged(data, start_us, worked); // Finish a region begun on an earlier frame first
+	for (int i = 0; i < ready.size(); i++) {
+		if (!_can_insert(inserted, worked, start_us)) {
+			break;
+		}
 		Ref<Terrain3DRegion> region = ResourceLoader::get_singleton()->load_threaded_get(ready[i].path);
 		_pending.erase(ready[i].loc);
 		if (region.is_null()) {
@@ -295,12 +327,8 @@ void Terrain3DStreamer::step() {
 		// does; otherwise persist_edits would rewrite every region it evicts. The on disk version is
 		// left alone: streaming is read only, and a save stamps the current version itself
 		region->set_modified(false);
-		if (data->add_region_streamed(region) == OK) {
-			_collision_refresh(ready[i].loc);
-			_landed_total += 1;
+		if (_insert(data, region, start_us, worked)) {
 			inserted += 1;
-			real_t ms = real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f;
-			_land_ms_avg = _land_ms_avg == 0.f ? ms : _land_ms_avg * 0.9f + ms * 0.1f;
 		} else if (data->get_free_slot_count() > 0) {
 			// Rejected with a slot available means the body itself is bad. Never
 			// re-request it, pool pressure alone retries fine
@@ -332,7 +360,7 @@ void Terrain3DStreamer::step() {
 		for (int dx = -_distance; dx <= _distance; dx++) {
 			Vector2i loc = floc + Vector2i(dx, dy);
 			if (!_known_set.has(loc) || data->has_region(loc) ||
-					_is_failed(loc) || _pending.has(loc)) {
+					_is_failed(loc) || _pending.has(loc) || _staged_set.has(loc) || _saving.has(loc)) {
 				continue;
 			}
 			real_t d = _distance_to(loc, floc);
@@ -352,19 +380,14 @@ void Terrain3DStreamer::step() {
 		if (_ram_cache.has(loc)) {
 			// RAM mode revisit: the body is already decoded, only the GPU upload
 			// remains. Still bounded by loads_per_frame
-			if (inserted >= _loads_per_frame || data->get_free_slot_count() <= 0) {
+			if (!_can_insert(inserted, worked, start_us) || data->get_free_slot_count() <= 0) {
 				continue;
 			}
-			uint64_t t0 = Time::get_singleton()->get_ticks_usec();
 			Ref<Terrain3DRegion> region = _ram_cache[loc];
 			_ram_cache.erase(loc);
 			region->set_location(loc);
-			if (data->add_region_streamed(region) == OK) {
-				_collision_refresh(loc);
-				_landed_total += 1;
+			if (_insert(data, region, start_us, worked)) {
 				inserted += 1;
-				real_t ms = real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f;
-				_land_ms_avg = _land_ms_avg == 0.f ? ms : _land_ms_avg * 0.9f + ms * 0.1f;
 			}
 			continue;
 		}
@@ -385,7 +408,7 @@ void Terrain3DStreamer::step() {
 		while (budget > 0 && _prefetch_cursor < _known.size()) {
 			Vector2i loc = _known[_prefetch_cursor];
 			_prefetch_cursor++;
-			if (data->has_region(loc) || _ram_cache.has(loc) || _is_failed(loc) || _pending.has(loc)) {
+			if (data->has_region(loc) || _ram_cache.has(loc) || _is_failed(loc) || _pending.has(loc) || _staged_set.has(loc)) {
 				continue;
 			}
 			String path = dir + String("/") + Util::location_to_filename(loc);
@@ -415,6 +438,8 @@ Dictionary Terrain3DStreamer::get_stats() const {
 	d["landed_total"] = (int64_t)_landed_total;
 	d["evicted_total"] = (int64_t)_evicted_total;
 	d["land_ms_avg"] = _land_ms_avg;
+	d["staged"] = (int)_staged.size();
+	d["saving"] = (int)_saving.size();
 	return d;
 }
 
@@ -429,6 +454,128 @@ real_t Terrain3DStreamer::_distance_to(const Vector2i &p_region_loc, const Vecto
 		return Vector2(d).length();
 	}
 	return real_t(MAX(ABS(d.x), ABS(d.y)));
+}
+
+// Hands an evicted body to a worker thread. A body with edits is saved first when
+// persist_edits is on; releasing it there keeps freeing its images off the main thread.
+void Terrain3DStreamer::_retire(const Vector2i &p_region_loc, const Ref<Terrain3DRegion> &p_region, const String &p_dir) {
+	RetireJob *job = memnew(RetireJob);
+	job->region = p_region;
+	job->loc = p_region_loc;
+	if (_persist_edits && !p_dir.is_empty() && p_region->is_modified()) {
+		job->path = p_dir + String("/") + Util::location_to_filename(p_region_loc);
+		job->save_16_bit = _terrain->get_save_16_bit();
+		_saving.insert(p_region_loc);
+	}
+	job->task = WorkerThreadPool::get_singleton()->add_task(
+			callable_mp(this, &Terrain3DStreamer::_run_retire_job).bind(int64_t(job)), false, "Terrain3D retire region");
+	_retiring.push_back(job);
+}
+
+// Runs on a worker thread. The job is owned by _retiring until its task is awaited.
+void Terrain3DStreamer::_run_retire_job(const int64_t p_job) {
+	RetireJob *job = reinterpret_cast<RetireJob *>(p_job);
+	if (!job->path.is_empty()) {
+		Error err = job->region->save(job->path, job->save_16_bit);
+		if (err != OK && err != ERR_SKIP) {
+			LOG(ERROR, "Could not save evicted region ", job->loc, " to ", job->path, ", error: ", err);
+		}
+	}
+	job->region.unref();
+}
+
+// Collects finished retire jobs, or all of them when p_wait is set
+void Terrain3DStreamer::_poll_retiring(const bool p_wait) {
+	for (int i = 0; i < _retiring.size();) {
+		RetireJob *job = _retiring[i];
+		if (!p_wait && !WorkerThreadPool::get_singleton()->is_task_completed(job->task)) {
+			i++;
+			continue;
+		}
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(job->task);
+		_saving.erase(job->loc);
+		memdelete(job);
+		_retiring.remove_at(i);
+	}
+}
+
+// True once this physics frame has spent its frame_budget_ms. Always false when the
+// budget is 0, which leaves loads_per_frame as the only limit.
+bool Terrain3DStreamer::_budget_spent(const uint64_t p_start_us) const {
+	return _frame_budget_ms > 0.f &&
+			real_t(Time::get_singleton()->get_ticks_usec() - p_start_us) * 0.001f >= _frame_budget_ms;
+}
+
+// Another region may start inserting: under a time budget one at a time while the budget
+// lasts, otherwise up to loads_per_frame per frame
+bool Terrain3DStreamer::_can_insert(const int p_inserted, const bool p_worked, const uint64_t p_start_us) const {
+	if (_frame_budget_ms > 0.f) {
+		return _staged.is_empty() && !(p_worked && _budget_spent(p_start_us));
+	}
+	return p_inserted < _loads_per_frame;
+}
+
+// Bookkeeping once a region is resident
+void Terrain3DStreamer::_land(const Vector2i &p_region_loc, const real_t p_ms) {
+	uint64_t t0 = Time::get_singleton()->get_ticks_usec();
+	_collision_refresh(p_region_loc);
+	real_t ms = p_ms + real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f;
+	_landed_total += 1;
+	_land_ms_avg = _land_ms_avg == 0.f ? ms : _land_ms_avg * 0.9f + ms * 0.1f;
+}
+
+// Inserts a loaded body: all at once, or reserved here and uploaded over the next
+// frames when a time budget is set. Returns false when the data rejected it.
+bool Terrain3DStreamer::_insert(Terrain3DData *p_data, const Ref<Terrain3DRegion> &p_region, const uint64_t p_start_us, bool &r_worked) {
+	uint64_t t0 = Time::get_singleton()->get_ticks_usec();
+	Vector2i loc = p_region->get_location();
+	if (_frame_budget_ms <= 0.f) {
+		if (p_data->add_region_streamed(p_region) != OK) {
+			return false;
+		}
+		_land(loc, real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f);
+		r_worked = true;
+		return true;
+	}
+	Staged staged;
+	staged.region = p_region;
+	if (p_data->reserve_region_streamed(p_region, staged.slot) != OK) {
+		return false;
+	}
+	if (staged.slot < 0) {
+		return true; // Already resident
+	}
+	staged.ms = real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f;
+	_staged.push_back(staged);
+	_staged_set.insert(loc);
+	r_worked = true;
+	_advance_staged(p_data, p_start_us, r_worked);
+	return true;
+}
+
+// Uploads the next layer of the oldest staged region, or makes it visible after the last
+// one, until the frame budget is spent. Runs at least one step when called with nothing done yet.
+void Terrain3DStreamer::_advance_staged(Terrain3DData *p_data, const uint64_t p_start_us, bool &r_worked) {
+	while (!_staged.is_empty()) {
+		if (r_worked && _budget_spent(p_start_us)) {
+			return;
+		}
+		uint64_t t0 = Time::get_singleton()->get_ticks_usec();
+		Staged &s = _staged.write[0];
+		Vector2i loc = s.region->get_location();
+		if (s.step < TYPE_MAX) {
+			p_data->upload_region_streamed(s.region, s.slot, MapType(s.step));
+			s.step += 1;
+			s.ms += real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f;
+		} else {
+			if (p_data->commit_region_streamed(s.region, s.slot) == OK) {
+				_land(loc, s.ms + real_t(Time::get_singleton()->get_ticks_usec() - t0) * 0.001f);
+			}
+			_staged_set.erase(loc);
+			_staged.remove_at(0);
+		}
+		r_worked = true;
+	}
 }
 
 // A streamed insertion only matters to collision when the region can intersect the

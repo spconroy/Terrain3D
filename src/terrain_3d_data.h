@@ -104,6 +104,11 @@ public:
 	int get_slot_capacity() const { return _slot_capacity; }
 	int get_free_slot_count() const { return _free_slots.size(); }
 	Error add_region_streamed(const Ref<Terrain3DRegion> &p_region);
+	// The same insertion in steps, so the streamer can spread it over frames
+	Error reserve_region_streamed(const Ref<Terrain3DRegion> &p_region, int &r_slot);
+	void upload_region_streamed(const Ref<Terrain3DRegion> &p_region, const int p_slot, const MapType p_map_type);
+	Error commit_region_streamed(const Ref<Terrain3DRegion> &p_region, const int p_slot);
+	void release_slot_streamed(const int p_slot) { _free_slots.push_back(p_slot); }
 	Error evict_region(const Vector2i &p_region_loc, const String &p_save_dir);
 	// Slot indexed while streaming, the dense id ordered list classically
 	TypedArray<Vector2i> get_shader_region_locations() const { return _streaming ? _slot_locs : _region_locations; }
