@@ -35,7 +35,7 @@ You pay in memory and VRAM only for the regions you allocate. Space between the 
 :target: ../_images/regions_used.jpg
 ```
 
-There is currently a limit of 1024 regions or 32 x 32. So the maximum dimensions of the your world are `32 * region_size`, the maximum being 32 * 2048 or 65,536m per side.
+There is a limit of 1024 regions or 32 x 32 in view at once, called the region map window. Without streaming the whole world must fit in it, so the maximum dimensions of your world are `32 * region_size`, the maximum being 32 * 2048 or 65,536m per side. With region streaming the window follows the camera, region locations are not limited, and the size of the world is only limited by the region files on disk.
 
 Region files are stored in the data directory as individual files, with their location coordinates in the filename. e.g. terrain3d_01-02.res, which represents region (+01, -02).
 

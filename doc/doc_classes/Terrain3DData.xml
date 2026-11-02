@@ -298,16 +298,29 @@
 		<method name="get_region_map" qualifiers="const">
 			<return type="PackedInt32Array" />
 			<description>
-				Returns a fully populated 32 x 32 array. The array location contains the region id + 1, or 0, which means no region.
+				Returns a fully populated array of [method get_region_map_size] x [method get_region_map_size] cells, 32 x 32 by default. The array location contains the region id + 1, or 0, which means no region.
 				See [method get_region_map_index].
 			</description>
 		</method>
-		<method name="get_region_map_index" qualifiers="static">
+		<method name="get_region_map_index" qualifiers="const">
 			<return type="int" />
 			<param index="0" name="region_location" type="Vector2i" />
 			<description>
 				Given a region location, returns the index into the region map array. See [method get_region_map].
-				You can use this function to quickly determine if a location is within the greater world bounds (-16,-16) to (15, 15). It returns -1 if not.
+				You can use this function to quickly determine if a location is within the region map window, which by default covers the locations (-16,-16) to (15, 15). It returns -1 if not.
+				This was a static function before the window could move; call it on the data object.
+			</description>
+		</method>
+		<method name="get_region_map_origin" qualifiers="const">
+			<return type="Vector2i" />
+			<description>
+				Returns the region location of the first cell of the region map window. It is (-16,-16) by default. See [method set_region_map_origin].
+			</description>
+		</method>
+		<method name="get_region_map_size" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the number of regions on a side of the region map window. See [member Terrain3D.region_map_size].
 			</description>
 		</method>
 		<method name="get_regionp" qualifiers="const">
@@ -390,7 +403,7 @@
 			<description>
 				Imports an Image set (Height, Control, Color) into this resource. It does NOT normalize values to 0-1. You must do that using get_min_max() and adjusting scale and offset.
 				[code skip-lint]images[/code] - MapType.TYPE_MAX sized array of Images for Height, Control, Color. Images can be blank or null.
-				[code skip-lint]global_position[/code] - X,0,Z position on the region map. Valid range is [member Terrain3D.vertex_spacing] * [member Terrain3D.region_size] * (+/-16, +/-16).
+				[code skip-lint]global_position[/code] - X,0,Z position on the region map. Valid range is [member Terrain3D.vertex_spacing] * [member Terrain3D.region_size] * the region map window, which is (+/-16, +/-16) by default. See [method set_region_map_origin].
 				[code skip-lint]offset[/code] - Add this factor to all height values, can be negative.
 				[code skip-lint]scale[/code] - Scale all height values by this factor (applied after offset).
 			</description>
@@ -608,6 +621,23 @@
 				Marks a region as deleted. It will stop displaying when maps are updated. The file will be removed on save.
 			</description>
 		</method>
+		<method name="set_region_map_origin">
+			<return type="void" />
+			<param index="0" name="origin" type="Vector2i" />
+			<description>
+				Moves the region map window so that its first cell is the region location [param origin]. Region locations are not limited, but only the regions inside the window are found by [method get_region_id] and [method has_region], rendered, and editable. The window is [member Terrain3D.region_map_size] regions on a side and starts at (-16,-16) by default.
+				While [member Terrain3D.streaming_enabled] the streamer centres the window on the clipmap target for you. Regions that end up outside the window stay loaded, but are not drawn until the window covers them or the streamer evicts them.
+				Otherwise all loaded regions must fit in the new window or it is not moved, and regions can only be added inside it. Set it before adding or loading regions that are far from the origin.
+				Region locations are limited to +/- 1048576. Region files with three or more digit locations are written and read, e.g. [code skip-lint]terrain3d_120-105.res[/code].
+			</description>
+		</method>
+		<method name="set_region_map_size">
+			<return type="void" />
+			<param index="0" name="size" type="int" />
+			<description>
+				Sets the number of regions on a side of the region map window to 8, 16 or 32 (other values round up to a power of two) and centres it on region (0,0). Not applied if loaded regions would fall outside it. Use [member Terrain3D.region_map_size] to keep the setting when the terrain data is recreated.
+			</description>
+		</method>
 		<method name="set_region_modified">
 			<return type="void" />
 			<param index="0" name="region_location" type="Vector2i" />
@@ -736,7 +766,7 @@
 			The terrain is exported as one Image per region. Filenames receive the region coordinates as a suffix, e.g. -01_03.exr
 		</constant>
 		<constant name="REGION_MAP_SIZE" value="32">
-			Hard coded number of regions on a side. The total number of regions is this squared.
+			The default and the maximum number of regions on a side of the region map window. The total number of regions in the window is this squared. See [method get_region_map_origin].
 		</constant>
 	</constants>
 </class>
