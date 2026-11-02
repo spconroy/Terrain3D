@@ -319,19 +319,18 @@ func target_speed(p_advance: float = 0.0) -> float:
 ## The smooth loader limited target: settles where the speed equals the loader's sustainable rate and the
 ## ready distance equals the desired margin (safety + stopping distance + a short buffer).
 func soft_target() -> float:
-	if not soft:
+	# Until a throughput sample exists (the loader was never saturated) the braking clamp alone limits the speed
+	if not soft or not rate_valid:
 		return INF
-	# Once the loader has limited the flight the speed is held at a share of its rate, also when everything ahead
-	# is loaded, so the flight is one smooth profile and does not speed up at the end
-	var hold := INF
-	if rate_valid and _limit_seen:
-		hold = clampf(cruise_fraction * rate_hold, floor_fraction * max_speed, max_speed)
+	# Once the loader has limited the flight the speed is held at a share of its rate when everything ahead is
+	# loaded, so the flight is one smooth profile and does not speed up at the end
 	if is_inf(ready_soft):
-		return hold
+		return clampf(cruise_fraction * rate_hold, floor_fraction * max_speed, max_speed) if _limit_seen else INF
+	# A healthy buffer (ready above the margin) lets the speed exceed the measured disk rate: regions that come from
+	# the RAM cache do not advance the front by disk loads, so the rate is a floor of the throughput, not a ceiling
 	var margin := safety + stop_distance(speed, max_accel * brake_fraction, max_jerk) + speed * margin_look
-	var rate_ref := rate_hold * 0.95 if rate_valid else speed
-	var v := rate_ref + soft_k * (ready_soft - margin)
-	return minf(clampf(v, floor_fraction * max_speed, max_speed), hold)
+	var v := rate_hold * 0.95 + soft_k * (ready_soft - margin)
+	return clampf(v, floor_fraction * max_speed, max_speed)
 
 
 func step(delta: float, ready_distance: float = INF) -> void:

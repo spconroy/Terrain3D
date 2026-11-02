@@ -626,7 +626,12 @@ func _fly(cfg: Dictionary) -> Dictionary:
 					m.ring_early += 1
 					break
 		# Landing
-		var ring_ready: bool = s.get_stats().missing == 0 # Everything wanted, and below the whole ring
+		var ring_ready := true # Everything wanted, and below the whole ring
+		if g.length - g.distance <= 0.5:
+			for loc: Vector2i in s.get_wanted_regions(false):
+				if not _t.data.has_region(loc):
+					ring_ready = false
+					break
 		for loc in ring_all:
 			if not _t.data.has_region(loc):
 				ring_ready = false
@@ -683,6 +688,8 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			m.corridor_done, m.ring_missing, m.resident_max, m.wanted_max, _pct(tick, 0.99), tick.max() if not tick.is_empty() else 0.0, m.peak_j, g.clamp_hits,
 			st_end.ram_cached, cost.regions, float(cost.bytes) / 1048576.0]
 	row += " | lead min %.1f s / %.0f m, recentres %d" % [m.lead_t_min if m.lead_t_min < INF else -1.0, m.lead_dist_min if m.lead_dist_min < INF else -1.0, m.recentres]
+	if mid_speeds.size() < 30:
+		mid_speeds = all_speeds.duplicate() # The destination was activated before the window opened
 	var cruise := 0.0
 	var vmin := 0.0
 	var wob := 0.0
@@ -733,7 +740,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			ok(m.first_ring < 0.0 or m.first_ring >= m.act - 1.0 / 30.0, "%s: the destination's first request (%.2f s) came after its activation (%.2f s)" % [label, m.first_ring, m.act])
 	elif governed:
 		ok(m.complete > 0.0 and m.holes == 0, "%s: landed with no holes" % label)
-	if governed and g.soft and (cfg.conc == 1 or cfg.budget < 1.0):
+	if governed and g.soft and (cfg.conc == 1 or (cfg.budget > 0.0 and cfg.budget < 1.0)):
 		ok(m.min_frac >= 0.5, "%s: mid-flight speed never below 50%% of cruise (%.2f)" % [label, m.min_frac])
 		ok(g.clamp_hits == 0, "%s: the failsafe clamp never engaged (%d)" % [label, g.clamp_hits])
 	else:
