@@ -23,7 +23,7 @@ void Terrain3DData::_clear() {
 	LOG(INFO, "Clearing data");
 	_region_map_dirty = true;
 	_region_map.clear();
-	_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
+	_region_map.resize(_region_map_size * _region_map_size);
 	_regions.clear();
 	_region_locations.clear();
 	_master_height_range = V2_ZERO;
@@ -99,7 +99,7 @@ void Terrain3DData::initialize(Terrain3D *p_terrain) {
 	LOG(INFO, "Initializing data");
 	bool prev_initialized = _terrain != nullptr;
 	_terrain = p_terrain;
-	_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
+	_region_map.resize(_region_map_size * _region_map_size);
 	_vertex_spacing = _terrain->get_vertex_spacing();
 	// Must be set before loading, as loading regions updates the maps and signals the collision, which divide by it
 	_region_size = _terrain->get_region_size();
@@ -299,8 +299,8 @@ Error Terrain3DData::add_region(const Ref<Terrain3DRegion> &p_region, const bool
 
 	// Check bounds and slow report errors
 	if (get_region_map_index(region_loc) < 0) {
-		LOG(ERROR, "Location ", region_loc, " out of bounds. Max: ",
-				-REGION_MAP_SIZE / 2, " to ", REGION_MAP_SIZE / 2 - 1);
+		LOG(ERROR, "Location ", region_loc, " out of bounds. Region map window: ",
+				_region_map_origin, " to ", _region_map_origin + V2I(_region_map_size - 1));
 		return FAILED;
 	}
 	p_region->sanitize_maps();
@@ -615,7 +615,7 @@ void Terrain3DData::enable_streaming(const int p_slot_capacity) {
 	_generated_color_maps.clear();
 	_generated_color_maps.create(coll);
 	_region_map.clear();
-	_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
+	_region_map.resize(_region_map_size * _region_map_size);
 	_region_map_dirty = false;
 	emit_signal("region_map_changed");
 	emit_signal("height_maps_changed");
@@ -758,9 +758,9 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 
 	// Rebuild region map if dirty
 	if (_region_map_dirty) {
-		LOG(EXTREME, "Regenerating ", REGION_MAP_VSIZE, " region map array from active regions");
+		LOG(EXTREME, "Regenerating ", V2I(_region_map_size), " region map array from active regions");
 		_region_map.clear();
-		_region_map.resize(REGION_MAP_SIZE * REGION_MAP_SIZE);
+		_region_map.resize(_region_map_size * _region_map_size);
 		_region_map_dirty = false;
 		_region_locations = TypedArray<Vector2i>(); // enforce new pointer
 		int region_id = 0;
@@ -1209,25 +1209,24 @@ void Terrain3DData::import_images(const TypedArray<Image> &p_images, const Vecto
 	const Vector2i img_end = img_start + img_size - Vector2i(1, 1);
 
 	// Validate vertex-grid range for the current region_size
-	// Regions run from -HALF .. HALF-1, each covering _region_size vertices
-	const int half = REGION_MAP_SIZE / 2;
-	const int min_v = -half * _region_size;
-	const int max_v = (half * _region_size) - 1; // inclusive
+	// The window covers _region_map_size regions from the origin, each covering _region_size vertices
+	const Vector2i min_v = _region_map_origin * _region_size;
+	const Vector2i max_v = (_region_map_origin + V2I(_region_map_size)) * _region_size - Vector2i(1, 1); // inclusive
 
-	if (img_start.x < min_v || img_start.y < min_v ||
-			img_end.x > max_v || img_end.y > max_v) {
+	if (img_start.x < min_v.x || img_start.y < min_v.y ||
+			img_end.x > max_v.x || img_end.y > max_v.y) {
 		// How large does region_size need to be for this image to fit
 		// (centred or placed at the requested position)?
 		const int required_span = MAX(img_size.x, img_size.y);
 		int min_region_size = _region_size;
 		while (min_region_size < Terrain3D::RegionSize::SIZE_2048 &&
-				required_span > min_region_size * REGION_MAP_SIZE) {
+				required_span > min_region_size * _region_map_size) {
 			min_region_size <<= 1;
 		}
 
 		LOG(ERROR, "Image of size ", img_size, " at ", v3v2i(p_global_position),
-				" does not fit within max width of ", REGION_MAP_SIZE, " * region_size ", _region_size,
-				" = ", REGION_MAP_SIZE * _region_size);
+				" does not fit within max width of ", _region_map_size, " * region_size ", _region_size,
+				" = ", _region_map_size * _region_size);
 
 		if (min_region_size > _region_size) {
 			LOG(ERROR, "Increase region_size to at least ", min_region_size,
@@ -1603,7 +1602,9 @@ void Terrain3DData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_regions_active", "copy", "deep"), &Terrain3DData::get_regions_active, DEFVAL(false), DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("get_regions_all"), &Terrain3DData::get_regions_all);
 	ClassDB::bind_method(D_METHOD("get_region_map"), &Terrain3DData::get_region_map);
-	ClassDB::bind_static_method("Terrain3DData", D_METHOD("get_region_map_index", "region_location"), &Terrain3DData::get_region_map_index);
+	ClassDB::bind_method(D_METHOD("get_region_map_index", "region_location"), &Terrain3DData::get_region_map_index);
+	ClassDB::bind_method(D_METHOD("get_region_map_size"), &Terrain3DData::get_region_map_size);
+	ClassDB::bind_method(D_METHOD("get_region_map_origin"), &Terrain3DData::get_region_map_origin);
 
 	ClassDB::bind_method(D_METHOD("do_for_regions", "area", "callback"), &Terrain3DData::do_for_regions);
 	ClassDB::bind_method(D_METHOD("change_region_size", "region_size"), &Terrain3DData::change_region_size);

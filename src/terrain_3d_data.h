@@ -16,8 +16,7 @@ class Terrain3DData : public Object {
 
 public: // Constants
 	static inline const real_t CURRENT_DATA_VERSION = 1.10f; // Current Data format version
-	static inline const int REGION_MAP_SIZE = 32;
-	static inline const Vector2i REGION_MAP_VSIZE = V2I(REGION_MAP_SIZE);
+	static inline const int REGION_MAP_SIZE = 32; // Default and maximum region map window size, in regions
 
 	enum HeightFilter {
 		HEIGHT_FILTER_NEAREST,
@@ -69,7 +68,10 @@ private:
 	// Editing occurs on the Image arrays above, which are converted to Texture arrays
 	// below for the shader.
 
-	// 32x32 grid with region_id:int at its location, no region = 0, region_ids >= 1
+	// A window of _region_map_size^2 cells with region_id:int at its location, no region = 0, region_ids >= 1.
+	// Cell (0,0) is the region location _region_map_origin, so locations are not limited to the window.
+	int _region_map_size = REGION_MAP_SIZE;
+	Vector2i _region_map_origin = V2I(-REGION_MAP_SIZE / 2);
 	PackedInt32Array _region_map;
 	bool _region_map_dirty = true;
 
@@ -112,7 +114,9 @@ public:
 	TypedArray<Terrain3DRegion> get_regions_active(const bool p_copy = false, const bool p_deep = false) const;
 	Dictionary get_regions_all() const { return _regions; }
 	PackedInt32Array get_region_map() const { return _region_map; }
-	static int get_region_map_index(const Vector2i &p_region_loc);
+	int get_region_map_index(const Vector2i &p_region_loc) const;
+	int get_region_map_size() const { return _region_map_size; }
+	Vector2i get_region_map_origin() const { return _region_map_origin; }
 
 	void do_for_regions(const Rect2i &p_area, const Callable &p_callback);
 	void change_region_size(int region_size);
@@ -230,18 +234,17 @@ VARIANT_ENUM_CAST(Terrain3DData::ExportMode);
 
 // Inline Region Functions
 
-// Verifies the location is within the bounds of the _region_map array and
-// the world, returning the _region_map index, which contains the region_id.
-// Valid region locations are -16, -16 to 15, 15, or when offset: 0, 0 to 31, 31
-// If any bits other than 0x1F are set, it's out of bounds and returns -1
-inline int Terrain3DData::get_region_map_index(const Vector2i &p_region_loc) {
-	// Offset world to positive values only
-	Vector2i loc = p_region_loc + (REGION_MAP_VSIZE / 2);
-	// Catch values > 31
-	if ((uint32_t(loc.x | loc.y) & uint32_t(~0x1F)) > 0) {
+// Verifies the location is within the region map window, returning the _region_map index,
+// which contains the region_id. By default the window is -16, -16 to 15, 15.
+// Offsetting by the origin gives 0 to size - 1; anything else, including negatives
+// (huge as unsigned), is out of bounds and returns -1. Unsigned math cannot overflow.
+inline int Terrain3DData::get_region_map_index(const Vector2i &p_region_loc) const {
+	const uint32_t x = uint32_t(p_region_loc.x) - uint32_t(_region_map_origin.x);
+	const uint32_t y = uint32_t(p_region_loc.y) - uint32_t(_region_map_origin.y);
+	if (x >= uint32_t(_region_map_size) || y >= uint32_t(_region_map_size)) {
 		return -1;
 	}
-	return loc.y * REGION_MAP_SIZE + loc.x;
+	return int(y) * _region_map_size + int(x);
 }
 
 // Returns a region location given a global position. No bounds checking nor data access.

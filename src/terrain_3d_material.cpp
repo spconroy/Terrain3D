@@ -708,12 +708,13 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 	Terrain3DData *data = _terrain->get_data();
 	PackedInt32Array region_map = data->get_region_map();
 	LOG(EXTREME, "region_map.size(): ", region_map.size());
-	if (region_map.size() != Terrain3DData::REGION_MAP_SIZE * Terrain3DData::REGION_MAP_SIZE) {
-		LOG(ERROR, "Expected region_map.size() of ", Terrain3DData::REGION_MAP_SIZE * Terrain3DData::REGION_MAP_SIZE);
+	const int map_size = data->get_region_map_size();
+	if (region_map.size() != map_size * map_size) {
+		LOG(ERROR, "Expected region_map.size() of ", map_size * map_size);
 		return;
 	}
 	RS->material_set_param(p_material, "_region_map", region_map);
-	RS->material_set_param(p_material, "_region_map_size", Terrain3DData::REGION_MAP_SIZE);
+	RS->material_set_param(p_material, "_region_map_size", map_size);
 	if (Terrain3D::debug_level >= EXTREME) {
 		LOG(EXTREME, "Region map");
 		for (int i = 0; i < region_map.size(); i++) {
