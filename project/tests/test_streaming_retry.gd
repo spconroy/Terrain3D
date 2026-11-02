@@ -4,7 +4,7 @@ extends SceneTree
 ## A region file that is unreadable at first (as during a copy) must stream in once it is
 ## fixed. One that stays unreadable is requested a bounded number of times, then ignored
 ## until the directory is rescanned.
-const DIR := "user://stream_retry_test"
+var _dir := "user://stream_retry_test_%d" % OS.get_process_id()
 const RETRY_SECONDS := 5.0 # Terrain3DStreamer::FAIL_RETRY_MSEC
 const RETRIES := 3 # Terrain3DStreamer::FAIL_RETRIES
 var _fail := 0
@@ -19,9 +19,9 @@ func ok(c: bool, m: String) -> void:
 
 
 func _initialize() -> void:
-	DirAccess.make_dir_recursive_absolute(DIR)
-	for f in DirAccess.get_files_at(DIR):
-		DirAccess.remove_absolute(DIR + "/" + f)
+	DirAccess.make_dir_recursive_absolute(_dir)
+	for f in DirAccess.get_files_at(_dir):
+		DirAccess.remove_absolute(_dir + "/" + f)
 	process_frame.connect(_run)
 
 
@@ -30,7 +30,7 @@ func _wait(p_seconds: float) -> void:
 
 
 func _write(p_name: String, p_bytes: PackedByteArray) -> void:
-	var f := FileAccess.open(DIR + "/" + p_name, FileAccess.WRITE)
+	var f := FileAccess.open(_dir + "/" + p_name, FileAccess.WRITE)
 	f.store_buffer(p_bytes)
 	f.close()
 
@@ -47,11 +47,11 @@ func _run() -> void:
 		t0.data.add_region_blank(Vector2i(x, 0), false)
 		t0.data.get_region(Vector2i(x, 0)).get_height_map().fill(Color(float(10 + x), 0, 0))
 	t0.data.update_maps()
-	t0.data.save_directory(DIR)
+	t0.data.save_directory(_dir)
 	t0.queue_free()
 	await process_frame
-	var good1: PackedByteArray = FileAccess.get_file_as_bytes(DIR + "/terrain3d_01_00.res")
-	var good2: PackedByteArray = FileAccess.get_file_as_bytes(DIR + "/terrain3d_02_00.res")
+	var good1: PackedByteArray = FileAccess.get_file_as_bytes(_dir + "/terrain3d_01_00.res")
+	var good2: PackedByteArray = FileAccess.get_file_as_bytes(_dir + "/terrain3d_02_00.res")
 	var garbage := PackedByteArray([1, 2, 3, 4, 5, 6, 7, 8])
 	_write("terrain3d_01_00.res", garbage)
 	_write("terrain3d_02_00.res", garbage)
@@ -62,7 +62,7 @@ func _run() -> void:
 	_t.streaming_enabled = true
 	_t.streaming_distance = 2
 	_t.streaming_slots = 49
-	_t.data_directory = DIR
+	_t.data_directory = _dir
 	root.add_child(_t)
 	var cam := Camera3D.new()
 	root.add_child(cam)
@@ -91,6 +91,6 @@ func _run() -> void:
 	await _wait(2.0)
 	ok(_t.data.has_region(Vector2i(2, 0)), "rescan clears the give up and loads it")
 
-	DirAccess.remove_absolute(DIR + "/terrain3d_00_00.res")
+	DirAccess.remove_absolute(_dir + "/terrain3d_00_00.res")
 	print("SUITE ", "GREEN" if _fail == 0 else "RED (%d)" % _fail)
 	quit(_fail)
