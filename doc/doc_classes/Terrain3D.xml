@@ -209,6 +209,11 @@
 			At runtime, the compressed color map is used in RAM and VRAM, and the uncompressed color map will be freed from RAM unless kept.
 			Note that compressed images cannot use set_pixel() or get_pixel(). If you wish to edit or read the pixel value of color or wetness at runtime, you must keep the uncompressed map in RAM. See [member keep_uncompressed_color].
 		</member>
+		<member name="color_map_enabled" type="bool" setter="set_color_map_enabled" getter="get_color_map_enabled" default="true">
+			Enables the color map, which holds the color tint (RGB) and the roughness / wetness (A) of the terrain. Disabling it frees the color texture array from VRAM, skips every color map lookup in the shader, and disables the Color and Roughness painting tools. Saved region data is not changed, so the map can be enabled again without loss.
+			The color images stay in RAM. To free them, see [method Terrain3DRegion.clear_color_map]. Override shaders generated while the map was enabled still sample it and render black; clear the override shader to regenerate it.
+			A disabled color map renders the same as an unpainted one: no tint and neutral roughness / wetness. Use this to save memory on projects that don't paint color or roughness, especially on mobile devices.
+		</member>
 		<member name="cull_margin" type="float" setter="set_cull_margin" getter="get_cull_margin" default="0.0">
 			This margin is added to the vertical component of the terrain mesh bounding boxes (AABB). The terrain already sets its AABB from [method Terrain3DData.get_height_range], which is calculated while sculpting. This setting only needs to be used if the shader has expanded the terrain beyond the AABB and the terrain meshes are being culled at certain viewing angles. This might happen from using [member Terrain3DMaterial.world_background] with NOISE and a height value larger than the terrain heights. This setting is similar to [code skip-lint]GeometryInstance3D.extra_cull_margin[/code], but it only affects the Y axis.
 		</member>
