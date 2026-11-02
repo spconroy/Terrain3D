@@ -7,7 +7,7 @@ extends SceneTree
 var _fail := 0
 var _done := false
 var _t: Terrain3D
-var _dir := "user://stream_dist_data"
+var _dir := "user://stream_dist_data_%d" % OS.get_process_id()
 const HALF := 16
 const RS := 64
 
