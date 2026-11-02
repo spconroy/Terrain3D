@@ -231,6 +231,15 @@ void Terrain3DStreamer::scan_directory() {
 // staged over frames (frame_budget_ms) and evicted bodies are retired on a worker thread.
 void Terrain3DStreamer::step() {
 	IS_INIT(VOID);
+	struct ProfTimer {
+		uint64_t &out;
+		uint64_t t0;
+		ProfTimer(uint64_t &o) :
+				out(o), t0(Time::get_singleton()->get_ticks_usec()) {}
+		~ProfTimer() { out = Time::get_singleton()->get_ticks_usec() - t0; }
+	} prof_timer(_prof_step_us);
+	_prof_recentre_us = 0;
+	_prof_flush_us = 0;
 	Terrain3DData *data = _terrain->get_data();
 	if (data == nullptr || !data->is_streaming()) {
 		return;
@@ -249,7 +258,10 @@ void Terrain3DStreamer::step() {
 	const int window = data->get_region_map_size();
 	if (floc.x - retained < origin.x || floc.y - retained < origin.y ||
 			floc.x + retained >= origin.x + window || floc.y + retained >= origin.y + window) {
+		uint64_t rc0 = Time::get_singleton()->get_ticks_usec();
 		data->set_region_map_origin(floc - V2I(window / 2));
+		_prof_recentre_us = Time::get_singleton()->get_ticks_usec() - rc0;
+		_prof_recentre_count++;
 	}
 	// Track the travel direction so regions ahead of travel load first on ties.
 	// A teleport (a jump beyond one region span) resets it.
@@ -696,6 +708,10 @@ Dictionary Terrain3DStreamer::get_stats() const {
 	d["missing"] = _stat_missing; // Wanted, inside the map window and not resident yet
 	d["deferred"] = _stat_deferred; // Wanted but the slot pool cannot hold them
 	d["outside_window"] = _stat_outside; // Wanted but beyond the region map window
+	d["prof_step_us"] = (int64_t)_prof_step_us;
+	d["prof_recentre_us"] = (int64_t)_prof_recentre_us;
+	d["prof_recentre_count"] = (int64_t)_prof_recentre_count;
+	d["prof_flush_us"] = (int64_t)_prof_flush_us;
 	return d;
 }
 
@@ -1232,7 +1248,9 @@ void Terrain3DStreamer::_collision_flush() {
 	_collision_dirty = false;
 	Terrain3DCollision *collision = _terrain->get_collision();
 	if (collision != nullptr && collision->is_enabled() && collision->is_dynamic_mode()) {
+		uint64_t fl0 = Time::get_singleton()->get_ticks_usec();
 		collision->update(V2I_MAX, true);
+		_prof_flush_us = Time::get_singleton()->get_ticks_usec() - fl0;
 	}
 }
 

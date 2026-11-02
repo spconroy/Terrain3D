@@ -128,6 +128,10 @@ private:
 	uint64_t _landed_total = 0; // Counters for get_stats()
 	uint64_t _evicted_total = 0;
 	real_t _land_ms_avg = 0.f;
+	uint64_t _prof_step_us = 0; // SCRATCH profiling (scratch/winval only)
+	uint64_t _prof_recentre_us = 0;
+	uint64_t _prof_recentre_count = 0;
+	uint64_t _prof_flush_us = 0;
 
 	real_t _distance_to(const Vector2i &p_region_loc, const Vector2i &p_focus_loc) const;
 	bool _is_wanted(const Vector2i &p_region_loc) const;
