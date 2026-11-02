@@ -134,6 +134,15 @@ func add_tool_button(p_params: Dictionary) -> void:
 	buttons[button2.get_name()] = button
 
 
+# Color and Roughness paint into the color map, so they are unavailable while it is disabled
+func update_color_tools(p_enabled: bool) -> void:
+	for child in get_children():
+		if child is Button and child.get_meta("Tool", -1) in [ Terrain3DEditor.COLOR, Terrain3DEditor.ROUGHNESS ]:
+			child.set_disabled(not p_enabled)
+			if not p_enabled and child.is_pressed():
+				change_tool("Raise")
+
+
 func get_button(p_name: String) -> Button:
 	return buttons.get(p_name, null)
 

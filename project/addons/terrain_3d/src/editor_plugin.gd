@@ -142,6 +142,11 @@ func _edit(p_object: Object) -> void:
 		if not terrain.assets_changed.is_connected(asset_dock.update_assets):
 			terrain.assets_changed.connect(asset_dock.update_assets)
 		asset_dock.update_assets()
+
+		# Get alerted when the color map is enabled or disabled
+		if not terrain.property_list_changed.is_connected(_update_color_tools):
+			terrain.property_list_changed.connect(_update_color_tools)
+		_update_color_tools()
 	else:
 		_clear()
 
@@ -161,6 +166,11 @@ func _make_visible(p_visible: bool, p_redraw: bool = false) -> void:
 		asset_dock.update_dock()
 	else:
 		ui.set_visible(false)
+
+
+func _update_color_tools() -> void:
+	if is_terrain_valid():
+		ui.toolbar.update_color_tools(terrain.color_map_enabled)
 
 
 func _clear() -> void:
@@ -386,7 +396,8 @@ func consume_hotkey(p_event: InputEventKey) -> bool:
 		KEY_S:
 			ui.toolbar.get_button("Slope").set_pressed(true)
 		KEY_C:
-			ui.toolbar.get_button("PaintColor").set_pressed(true)
+			if terrain.color_map_enabled:
+				ui.toolbar.get_button("PaintColor").set_pressed(true)
 		KEY_N:
 			ui.toolbar.get_button("PaintNavigableArea").set_pressed(true)
 		KEY_I:
@@ -394,7 +405,8 @@ func consume_hotkey(p_event: InputEventKey) -> bool:
 		KEY_X:
 			ui.toolbar.get_button("AddHoles").set_pressed(true)
 		KEY_W:
-			ui.toolbar.get_button("PaintWetness").set_pressed(true)
+			if terrain.color_map_enabled:
+				ui.toolbar.get_button("PaintWetness").set_pressed(true)
 		KEY_B:
 			ui.toolbar.get_button("PaintTexture").set_pressed(true)
 		KEY_V:

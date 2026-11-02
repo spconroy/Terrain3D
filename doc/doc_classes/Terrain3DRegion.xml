@@ -87,8 +87,9 @@
 		</method>
 		<method name="sanitize_maps">
 			<return type="void" />
+			<param index="0" name="color" type="bool" default="true" />
 			<description>
-				Sanitizes all map types. See [method sanitize_map].
+				Sanitizes all map types. See [method sanitize_map]. If [param color] is false the color map is left untouched, as when [member Terrain3D.color_map_enabled] is false.
 			</description>
 		</method>
 		<method name="save">
