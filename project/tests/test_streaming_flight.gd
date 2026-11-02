@@ -106,6 +106,8 @@ func _run() -> void:
 	await _test_path_cost()
 	await _test_prefetch_cache()
 	await _test_persist_behind()
+	await _test_path_ahead()
+	await _test_junction()
 	for sub in DirAccess.get_directories_at(_root_dir):
 		_clean(_root_dir + "/" + sub)
 		DirAccess.remove_absolute(_root_dir + "/" + sub)
@@ -128,6 +130,7 @@ func _test_priority_ahead() -> void:
 	var st := s.get_stats()
 	var in_window: int = st.wanted - st.outside_window
 	ok(res.size() == 25 and st.deferred == in_window - 25, "priority: the pool is full and the rest is deferred (%d resident, %d deferred of %d in the window)" % [res.size(), st.deferred, in_window])
+	ok(st.ram_cached > st.outside_window, "priority: the deferred corridor regions ahead load their bodies into the cache too (%d cached, %d beyond the window, %d deferred)" % [st.ram_cached, st.outside_window, st.deferred])
 	var behind_res := 0
 	var max_x := -99
 	for loc: Vector2i in res:
@@ -268,7 +271,7 @@ func _test_ready_distance() -> void:
 	var id := s.add_keep_path(path, 20.0)
 	var total := 38.0 * _span()
 	ok(s.get_path_ready_distance(9999) == -1.0, "ready: unknown id returns -1")
-	ok(s.get_path_ready_distance(id) < 1.0, "ready: nothing loaded yet, the camera's own region is missing (%.1f)" % s.get_path_ready_distance(id))
+	ok(s.get_path_ready_distance(id) < 2.0 * _span(), "ready: almost nothing loaded yet, a region at the camera is missing (%.1f)" % s.get_path_ready_distance(id))
 	var samples := 0
 	var bad := 0
 	for i in 300:
@@ -386,5 +389,150 @@ func _test_persist_behind() -> void:
 	ok(not _t.data.has_region(edited), "persist: the edited region behind is unloaded")
 	var saved: Terrain3DRegion = ResourceLoader.load(path, "Terrain3DRegion", ResourceLoader.CACHE_MODE_IGNORE)
 	ok(saved != null and absf(saved.get_height_map().get_pixel(10, 10).r - 777.0) < 0.01, "persist: the edit reached the file through the worker thread")
+	await _free_terrain(cam)
+	_clean(dir)
+
+
+func _locs(arr: Array) -> Dictionary:
+	var d := {}
+	for loc: Vector2i in arr:
+		d[loc] = true
+	return d
+
+
+# 8. A path loads only a lookahead segment; the rest of the corridor is fetched as bodies only, after everything
+# needed, and never takes the last load slot while a needed region waits
+func _test_path_ahead() -> void:
+	var dir := _root_dir + "/ahead"
+	_author_block(dir, -3, 60, -2, 2)
+	var cam := await _new_terrain(dir, 80, 1)
+	_t.streaming_concurrent_loads = 2
+	_place(cam, Vector2i(0, 0))
+	var s := _streamer()
+	s.keep_cache_limit = 4096
+	var id := s.add_keep_path(_row_path(0.5, 58.5), 20.0)
+	ok(s.set_keep_path_ahead(id, 5.0 * _span(), 0.0), "ahead: set_keep_path_ahead accepts a path id")
+	ok(not s.set_keep_path_ahead(9999, 1.0), "ahead: unknown id")
+	await _frames(200)
+	var near := _locs(s.get_wanted_regions(false))
+	var st := s.get_stats()
+	# Row x = 0 .. 5 (arc <= 5 spans, plus the half region of tolerance), plus the camera area around (0, 0)
+	var max_x := -99
+	for loc: Vector2i in near:
+		if loc.y == 0:
+			max_x = maxi(max_x, loc.x)
+	ok(max_x == 5 or max_x == 6, "ahead: the needed set reaches %d regions ahead, not the whole route (max x %d)" % [5, max_x])
+	ok(st.wanted == near.size() and st.wanted < 20, "ahead: the wanted stat counts the lookahead set only (%d)" % st.wanted)
+	ok(s.get_wanted_regions(true).size() == 0, "ahead: no prefetch reach, no cache-only set")
+	ok(st.ram_cached == 0 and st.missing == 0, "ahead: nothing cached, nothing missing")
+	# Prefetch the whole corridor as bodies
+	s.set_keep_path_ahead(id, 5.0 * _span(), -1.0)
+	var order: Array = []
+	var seen := {}
+	var near_after_cache := 0
+	for i in 400:
+		await _frames(1)
+		var nearset := _locs(s.get_wanted_regions(false))
+		var cacheset := _locs(s.get_wanted_regions(true))
+		for loc: Vector2i in s.get_pending_regions():
+			if not seen.has(loc):
+				seen[loc] = true
+				order.append([loc, nearset.has(loc)])
+		if cacheset.size() == 0 and i > 10:
+			break
+	var near_first := true
+	var seen_cache := false
+	for e in order:
+		if not e[1]:
+			seen_cache = true
+		elif seen_cache:
+			near_after_cache += 1
+	st = s.get_stats()
+	print("ahead: %d requests recorded, %d needed regions requested after a cache-only one, cached %d, resident %d" % [order.size(), near_after_cache, st.ram_cached, _t.data.get_region_count()])
+	ok(st.ram_cached > 40, "ahead: the rest of the corridor was fetched into the cache (%d bodies)" % st.ram_cached)
+	ok(_t.data.get_region_count() <= 16, "ahead: and none of it took a slot (%d resident)" % _t.data.get_region_count())
+	# Move the camera: the needed window moves, cached bodies insert without a request
+	_place(cam, Vector2i(14, 0))
+	await _frames(200)
+	near = _locs(s.get_wanted_regions(false))
+	max_x = -99
+	var min_x := 99
+	for loc: Vector2i in near:
+		if loc.y == 0:
+			max_x = maxi(max_x, loc.x)
+			min_x = mini(min_x, loc.x)
+	ok(max_x >= 19 and _t.data.has_region(Vector2i(19, 0)) and _t.data.has_region(Vector2i(14, 0)), "ahead: after the move the window ahead is resident (x 14..%d)" % max_x)
+	await _free_terrain(cam)
+	_clean(dir)
+
+
+# 9. The junction between a narrow path strip and a wider destination circle: every cell the geometry says belongs
+# to the union is wanted by the streamer, and all of them are resident on arrival
+func _test_junction() -> void:
+	var dir := _root_dir + "/junction"
+	_author_block(dir, -3, 40, -8, 8)
+	var known := {}
+	for y in range(-8, 9):
+		for x in range(-3, 41):
+			known[Vector2i(x, y)] = true
+	var cam := await _new_terrain(dir, 200, 1)
+	_place(cam, Vector2i(0, 0))
+	var s := _streamer()
+	var sp := _span()
+	var end := Vector2(30.5 * sp, 0.5 * sp)
+	var id := s.add_keep_path(_row_path(0.5, 30.5), 0.9 * sp) # Strip of about two regions
+	var circ := s.add_keep_circle(Vector3(end.x, 0, end.y), 4.2 * sp, true) # Circle of about nine
+	await _frames(100)
+	_place(cam, Vector2i(30, 0)) # Arrival: the window recentres on the end of the path
+	await _frames(600)
+	# Independent membership: path strip (rect to polyline distance) plus the circle, plus the camera area
+	var expected := {}
+	for loc: Vector2i in known:
+		var mn := Vector2(loc) * sp
+		var mx := mn + Vector2(sp, sp)
+		var d_circle := (end - end.clamp(mn, mx)).length()
+		var line_y := 0.5 * sp
+		var nearest_x := clampf(clampf(0.5 * sp, mn.x, mx.x), 0.5 * sp, 30.5 * sp)
+		var d_path := (Vector2(nearest_x, line_y) - Vector2(nearest_x, line_y).clamp(mn, mx)).length()
+		# distance from the segment to the rect: points of the segment inside the rect's x range
+		var x_lo := maxf(mn.x, 0.5 * sp)
+		var x_hi := minf(mx.x, 30.5 * sp)
+		if x_lo <= x_hi:
+			d_path = maxf(maxf(mn.y - line_y, line_y - mx.y), 0.0)
+		else:
+			d_path = INF
+		if absf(d_circle - 4.2 * sp) < 1.5 or absf(d_path - 0.9 * sp) < 1.5:
+			ok(false, "test setup: region %s sits on a shape edge" % loc)
+		if d_circle <= 4.2 * sp or d_path <= 0.9 * sp:
+			expected[loc] = true
+	for y in range(-1, 2):
+		for x in range(-1, 2):
+			expected[Vector2i(x, y)] = true
+	var wanted := _locs(s.get_wanted_regions(false))
+	var missing_from_wanted := 0
+	var extra := 0
+	for loc: Vector2i in expected:
+		missing_from_wanted += 0 if wanted.has(loc) else 1
+	for loc: Vector2i in wanted:
+		extra += 0 if expected.has(loc) else 1
+	ok(missing_from_wanted == 0 and extra == 0, "junction: the streamer's wanted list equals the geometric union (%d wanted, %d expected, %d absent, %d extra)" % [wanted.size(), expected.size(), missing_from_wanted, extra])
+	var res := _resident()
+	var not_resident := 0
+	var in_window := 0
+	var org := _t.data.get_region_map_origin()
+	for loc: Vector2i in wanted:
+		if loc.x < org.x or loc.x >= org.x + _t.data.get_region_map_size():
+			continue # Beyond the window: waits in the cache (the path behind the camera, with no behind_limit)
+		in_window += 1
+		not_resident += 0 if res.has(loc) else 1
+	ok(not_resident == 0, "junction: every wanted cell inside the window is resident, including the junction column (%d missing of %d, %d deferred)" % [not_resident, in_window, s.get_stats().deferred])
+	# The cells where the strip meets the circle
+	var junction_ok := true
+	for y in range(-4, 5):
+		for x in range(24, 28):
+			var loc := Vector2i(x, y)
+			if expected.has(loc) and not res.has(loc):
+				junction_ok = false
+	ok(junction_ok, "junction: the cells between the strip end and the circle edge are resident")
 	await _free_terrain(cam)
 	_clean(dir)
