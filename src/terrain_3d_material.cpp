@@ -212,6 +212,9 @@ String Terrain3DMaterial::_generate_shader_code() const {
 			excludes.push_back("TEXTURE_SAMPLERS_LINEAR_ANISOTROPIC");
 			break;
 	}
+	if (_terrain->get_color_map_enabled()) {
+		excludes.push_back("NO_COLOR_MAP");
+	}
 	if (!_auto_shader_enabled) {
 		excludes.push_back("AUTO_SHADER_UNIFORMS");
 		excludes.push_back("AUTO_SHADER");
@@ -599,6 +602,9 @@ void Terrain3DMaterial::_update_shader() {
 			_shader_override->set_code(_generate_shader_code());
 		}
 		code = _shader_override->get_code();
+		if (!_terrain->get_color_map_enabled()) {
+			LOG(WARN, "The color map is disabled. An override shader generated while it was enabled still samples it and will render black. Clear the override shader to regenerate it.");
+		}
 		if (!_shader_override->is_connected("changed", callable_mp(this, &Terrain3DMaterial::_update_shader))) {
 			LOG(DEBUG, "Connecting changed signal to _update_shader()");
 			_shader_override->connect("changed", callable_mp(this, &Terrain3DMaterial::_update_shader));
@@ -740,7 +746,8 @@ void Terrain3DMaterial::_update_uniforms(const RID &p_material, const uint32_t p
 		if (data->get_region_count() > 0) {
 			RS->material_set_param(p_material, "_height_maps", data->get_height_maps_rid());
 			RS->material_set_param(p_material, "_control_maps", data->get_control_maps_rid());
-			RS->material_set_param(p_material, "_color_maps", data->get_color_maps_rid());
+			// A disabled color map has no array; the shader skips all fetches, but a valid sampler must still be bound
+			RS->material_set_param(p_material, "_color_maps", _terrain->get_color_map_enabled() ? data->get_color_maps_rid() : _generated_dummy.get_rid());
 			LOG(EXTREME, "Height map RID: ", data->get_height_maps_rid());
 			LOG(EXTREME, "Control map RID: ", data->get_control_maps_rid());
 			LOG(EXTREME, "Color map RID: ", data->get_color_maps_rid());
