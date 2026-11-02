@@ -18,4 +18,7 @@ R"(
 #define FILTER_NEAREST
 #define FILTER_METHOD filter_nearest_mipmap
 
+//INSERT: NO_COLOR_MAP
+#define NO_COLOR_MAP
+
 )"

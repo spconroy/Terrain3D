@@ -616,6 +616,27 @@ void Terrain3D::set_save_16_bit(const bool p_enabled) {
 	}
 }
 
+void Terrain3D::set_color_map_enabled(const bool p_enabled) {
+	SET_IF_DIFF(_color_map_enabled, p_enabled);
+	LOG(INFO, "Setting color map enabled: ", _color_map_enabled);
+	if (_data) {
+		// At runtime, free the maps from RAM when disabled, or restore them from disk when enabled
+		for (const Ref<Terrain3DRegion> &region : _data->get_regions_active()) {
+			if (!_color_map_enabled) {
+				region->release_color_maps();
+			} else if (region->get_color_map().is_null() && region->get_compressed_color_map().is_null()) {
+				region->load_color_maps_from_file();
+			}
+		}
+		// Rebuild or free the color texture array
+		_data->update_maps(TYPE_COLOR, true, _color_map_enabled);
+	}
+	if (_material.is_valid()) {
+		// Recompile shader with / without NO_COLOR_MAP and rebind the arrays
+		_material->update(Terrain3DMaterial::FULL_REBUILD);
+	}
+}
+
 void Terrain3D::set_color_compress_mode(const CompressMode p_color_compress_mode) {
 	SET_IF_DIFF(_color_compress_mode, CLAMP(p_color_compress_mode, COMPRESS_S3TC, COMPRESS_NONE));
 	LOG(INFO, "Setting compression mode for color maps: ", _color_compress_mode);
@@ -1407,6 +1428,8 @@ void Terrain3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_region_size"), &Terrain3D::get_region_size);
 	ClassDB::bind_method(D_METHOD("set_save_16_bit", "enabled"), &Terrain3D::set_save_16_bit);
 	ClassDB::bind_method(D_METHOD("get_save_16_bit"), &Terrain3D::get_save_16_bit);
+	ClassDB::bind_method(D_METHOD("set_color_map_enabled", "enabled"), &Terrain3D::set_color_map_enabled);
+	ClassDB::bind_method(D_METHOD("get_color_map_enabled"), &Terrain3D::get_color_map_enabled);
 	ClassDB::bind_method(D_METHOD("set_color_compress_mode", "compress_mode"), &Terrain3D::set_color_compress_mode);
 	ClassDB::bind_method(D_METHOD("get_color_compress_mode"), &Terrain3D::get_color_compress_mode);
 	ClassDB::bind_method(D_METHOD("set_keep_uncompressed_color", "enabled"), &Terrain3D::set_keep_uncompressed_color);
@@ -1581,6 +1604,7 @@ void Terrain3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "show_grid"), "set_show_region_grid", "get_show_region_grid");
 	ADD_SUBGROUP("Advanced", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "save_16_bit"), "set_save_16_bit", "get_save_16_bit");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "color_map_enabled"), "set_color_map_enabled", "get_color_map_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "color_compress_mode", PROPERTY_HINT_ENUM,
 						 "None:5,S3TC (Desktop):0,BPTC (Desktop HQ):3,ETC (Mobile LQ):1,ETC2 (Mobile):2,ASTC (Mobile):4"),
 			"set_color_compress_mode", "get_color_compress_mode");

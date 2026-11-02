@@ -5,6 +5,7 @@
 #include "terrain_3d_data.h"
 #include "terrain_3d_util.h"
 #include <godot_cpp/classes/engine.hpp>
+#include <godot_cpp/classes/resource_loader.hpp>
 #include <godot_cpp/classes/resource_saver.hpp>
 
 /////////////////////
@@ -213,6 +214,31 @@ void Terrain3DRegion::compress_color_map(const CompressMode p_compress_mode) {
 	}
 }
 
+// Frees the color maps from RAM at runtime. Only when they can be restored from the file on disk.
+// Returns true if the maps were freed
+bool Terrain3DRegion::release_color_maps() {
+	if (IS_EDITOR || _modified || get_path().is_empty()) {
+		return false;
+	}
+	clear_color_map();
+	clear_compressed_color_map();
+	return true;
+}
+
+// Reloads the color maps from this region's file without replacing this region object
+bool Terrain3DRegion::load_color_maps_from_file() {
+	if (get_path().is_empty()) {
+		return false;
+	}
+	Ref<Terrain3DRegion> disk = ResourceLoader::get_singleton()->load(get_path(), "Terrain3DRegion", ResourceLoader::CACHE_MODE_IGNORE);
+	if (disk.is_null() || (disk->get_color_map().is_null() && disk->get_compressed_color_map().is_null())) {
+		return false;
+	}
+	_color_map = disk->get_color_map();
+	_compressed_color_map = disk->get_compressed_color_map();
+	return true;
+}
+
 void Terrain3DRegion::check_compressed_color_map(const CompressMode p_compress_mode) {
 	if (_last_color_compression != p_compress_mode) {
 		LOG(INFO, "Setting region ", _location, " modified as loaded color compression mode differs from Terrain3D setting");
@@ -374,6 +400,8 @@ Error Terrain3DRegion::save(const String &p_path, const bool p_16_bit, const Com
 		LOG(INFO, "Region ", _location, " not modified. Skipping ", p_path);
 		return ERR_SKIP;
 	}
+	// If the color maps were released from RAM, borrow them from the file being overwritten so they aren't lost
+	const bool borrowed_color = !IS_EDITOR && _color_map.is_null() && _compressed_color_map.is_null() && load_color_maps_from_file();
 	_compressed_color_map.unref();
 	if (IS_EDITOR) {
 		compress_color_map(p_color_compress_mode);
@@ -389,6 +417,10 @@ Error Terrain3DRegion::save(const String &p_path, const bool p_16_bit, const Com
 		_height_map = original_map;
 	} else {
 		err = ResourceSaver::get_singleton()->save(this, get_path(), ResourceSaver::FLAG_COMPRESS);
+	}
+	if (borrowed_color) {
+		clear_color_map();
+		clear_compressed_color_map();
 	}
 	if (err == OK) {
 		_modified = false;

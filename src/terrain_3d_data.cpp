@@ -312,6 +312,11 @@ Error Terrain3DData::add_region(const Ref<Terrain3DRegion> &p_region, const bool
 		// Else (compressed && keep), keep both maps
 	}
 
+	// A disabled color map is never used, so free it from RAM at runtime. It is restored from disk if needed.
+	if (!_terrain->get_color_map_enabled()) {
+		p_region->release_color_maps();
+	}
+
 	p_region->set_deleted(false);
 	if (!_region_locations.has(region_loc)) {
 		_region_locations.push_back(region_loc);
@@ -616,7 +621,11 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 	}
 
 	// Rebuild color maps if dirty
-	if (_generated_color_maps.is_dirty()) {
+	// A disabled color map is not built. Dropping the array here also releases the images from RAM.
+	const bool color_enabled = _terrain->get_color_map_enabled();
+	if (!color_enabled) {
+		_color_maps.clear();
+	} else if (_generated_color_maps.is_dirty()) {
 		LOG(EXTREME, "Regenerating color texture array from regions");
 		_color_maps.clear();
 		for (const Vector2i &region_loc : _region_locations) {
@@ -655,6 +664,9 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 						emit_signal("control_maps_changed");
 						break;
 					case TYPE_COLOR:
+						if (!color_enabled) {
+							break;
+						}
 						_generated_color_maps.update(region->get_active_color_map(), region_id);
 						LOG(DEBUG, "Emitting color_maps_changed");
 						emit_signal("color_maps_changed");
@@ -662,7 +674,9 @@ void Terrain3DData::update_maps(const MapType p_map_type, const bool p_all_regio
 					default:
 						_generated_height_maps.update(region->get_height_map(), region_id);
 						_generated_control_maps.update(region->get_control_map(), region_id);
-						_generated_color_maps.update(region->get_active_color_map(), region_id);
+						if (color_enabled) {
+							_generated_color_maps.update(region->get_active_color_map(), region_id);
+						}
 						LOG(DEBUG, "Emitting height_maps_changed");
 						emit_signal("height_maps_changed");
 						LOG(DEBUG, "Emitting control_maps_changed");

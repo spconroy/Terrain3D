@@ -24,6 +24,7 @@ var add_tool_group: ButtonGroup = ButtonGroup.new()
 var sub_tool_group: ButtonGroup = ButtonGroup.new()
 var buttons: Dictionary
 var plugin: EditorPlugin
+var _color_tools_enabled: bool = true
 
 
 func _init() -> void:
@@ -132,6 +133,24 @@ func add_tool_button(p_params: Dictionary) -> void:
 	button2.set_button_group(p_params.get("group", sub_tool_group))
 	add_child(button2, true)
 	buttons[button2.get_name()] = button
+
+
+func _process(_delta: float) -> void:
+	if not plugin or not is_instance_valid(plugin.terrain) or not is_visible_in_tree():
+		return
+	var enabled: bool = plugin.terrain.color_map_enabled
+	if enabled != _color_tools_enabled:
+		update_color_tools(enabled)
+
+
+# Color and Roughness paint into the color map, so they are unavailable while it is disabled
+func update_color_tools(p_enabled: bool) -> void:
+	_color_tools_enabled = p_enabled
+	for child in get_children():
+		if child is Button and child.get_meta("Tool", -1) in [ Terrain3DEditor.COLOR, Terrain3DEditor.ROUGHNESS ]:
+			child.set_disabled(not p_enabled)
+			if not p_enabled and child.is_pressed():
+				change_tool("Raise")
 
 
 func get_button(p_name: String) -> Button:
