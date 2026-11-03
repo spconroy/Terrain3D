@@ -234,6 +234,12 @@ func _run() -> void:
 				plan.append(_cfg(cb, "%d m 10 km collision %s, budget %.0f ms" % [rs, coll, budget], {"collision": coll, "budget": budget}))
 	if sizes.has(512):
 		plan[0].csv = true
+	if _args.has("gov"): # gov=name:value,name:value overrides governor properties for every flight (tuning runs)
+		for kv: String in String(_args["gov"]).split(","):
+			var parts := kv.split(":")
+			for cfg: Dictionary in plan:
+				cfg.gov = cfg.gov.duplicate()
+				cfg.gov[parts[0]] = float(parts[1])
 	for cfg: Dictionary in plan:
 		if only != "" and cfg.label.find(only) < 0:
 			continue
@@ -511,7 +517,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 					var glat := maxf(maxf(gmn.y - start.y, start.y - (gmn.y + sp)), 0.0)
 					if glat > radius_q + 1.0:
 						continue
-					var at := maxf(gmn.x - start.x, g.distance)
+					var at := maxf(gmn.x - start.x - radius_q, g.distance) # As get_path_ready_distance: the rectangle widened by the corridor radius
 					if at < held_at:
 						held_at = at
 						held_loc = gloc

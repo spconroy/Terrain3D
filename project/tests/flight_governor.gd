@@ -25,6 +25,13 @@ extends RefCounted
 ##     g.step(delta, streamer.get_path_ready_distance(path_id))
 ##     scale the corridor radius, cone width and lookahead with g.quality (and g.safety), blur with g.speed_fraction()
 ##   metres_per_load = region size / regions in one column of the corridor at the current radius.
+##   With an insert gate (Terrain3DStreamer.insert_gate) also call g.observe_gate(held_at, location) before step():
+##   held_at = meters along the path where the nearest HELD region the corridor needs (get_gated_regions()) enters the corridor,
+##   measured like get_path_ready_distance does (the region's rectangle widened by the corridor radius), INF if none; location is
+##   that region (Vector2i). Regions the gate holds are loaded, not slow to load: they do not count as loader slowness (no rate
+##   sample, no quality loss) and the camera approaches the edge of the visible terrain smoothly. Set gate_eta (Callable(location)
+##   -> seconds until it is released, <0 unknown) if the game knows the release time: the camera then arrives at the edge just
+##   when the region becomes visible instead of stopping there.
 ##   then place the camera at path(g.distance) with g.altitude, g.pitch and g.fov, and hold the landing
 ##   (keep hovering) until the destination is loaded: g.is_done(destination_loaded).
 ##
@@ -125,6 +132,25 @@ var _observed := false
 var _unsat_time := 0.0
 var limit_seen := false ## The loader has limited this flight at some point
 
+## INSERT GATE. Regions the gate holds are not slow to load: while the first missing region ahead is held by the gate (gate_blocked)
+## the loader's metrics are not touched (no rate sample, no probing, no quality loss, limit_seen stays) and the speed follows the gate
+## law instead of the loader law: gate_k x the visible terrain above the margin (an exponential approach to the edge, 1/gate_k s time
+## constant), or, when the game provides gate_eta (Callable(location) -> seconds until the region is released, <0 unknown) and the
+## release is more than gate_eta_long away, the speed that reaches the edge just when the region becomes visible. The braking distance clamp and the failsafe stay underneath, so a wrong
+## estimate costs a stop, never a hole.
+var gate_aware := true
+var gate_eta := Callable()
+var gate_eta_long := 1.5 ## s: a release further away than this is waited for with the eta law; a nearer one with the quick gate_k law
+var gate_tol := 300.0 ## m: the front counts as held by the gate when the nearest held region enters the corridor this close to it
+var gate_k := 5.0 ## 1/s: speed per meter of visible terrain above the margin when the release time is unknown
+var gate_jerk_fraction := 0.6 ## of max_jerk while the gate law speeds the camera up (it slows with the braking distance clamp's deceleration and full jerk)
+var gate_blocked := false ## The first missing region ahead is held by the gate this step
+var gate_target := INF ## The gate law's speed this step (INF when not blocked)
+var gate_eta_now := -1.0 ## The release time used this step (<0 = estimated)
+var gate_blocked_time := 0.0 ## Total time the front was held by the gate
+var _gate_at := INF
+var _gate_loc = null
+
 var start_altitude := 0.0
 var cruise_altitude := 0.0
 var end_altitude := 0.0
@@ -154,7 +180,7 @@ func observe_loader(delta: float, disk_loads_total: int, saturated: bool, metres
 	if _win_loads < 0:
 		_win_loads = disk_loads_total
 	_win_t += delta
-	_win_sat += delta if saturated else 0.0
+	_win_sat += delta if saturated and not gate_blocked else 0.0 # A front held by the gate says nothing about the loader
 	if _win_t < rate_window:
 		return
 	var r := float(disk_loads_total - _win_loads) / _win_t * metres_per_load
@@ -169,6 +195,14 @@ func observe_loader(delta: float, disk_loads_total: int, saturated: bool, metres
 	_win_t = 0.0
 	_win_sat = 0.0
 	_win_loads = disk_loads_total
+
+
+## Feed the insert gate: held_at is the distance along the path (same axis as `distance`) where the nearest region that the gate
+## holds and the path corridor needs enters the corridor, INF if none; location is that region (given to gate_eta).
+## Call every physics frame before step(), only when a gate is set.
+func observe_gate(held_at: float, location = null) -> void:
+	_gate_at = held_at
+	_gate_loc = location
 
 
 ## Landed: the footprint goes back to full
@@ -230,6 +264,12 @@ func setup(path_length: float, heights: PackedFloat32Array, sample_step: float, 
 	_observed = false
 	_unsat_time = 0.0
 	limit_seen = false
+	gate_blocked = false
+	gate_target = INF
+	gate_eta_now = -1.0
+	gate_blocked_time = 0.0
+	_gate_at = INF
+	_gate_loc = null
 	safety_full = -1.0
 	distance = 0.0
 	speed = 0.0
@@ -333,6 +373,24 @@ func soft_target() -> float:
 	return clampf(v, floor_fraction * max_speed, max_speed)
 
 
+## The speed from which the camera reaches the edge of the visible terrain (ready less the margin) when the gate releases the
+## region that holds it: gap / time to release, with gate_eta (or the estimate) as the time. Not a floor: the camera may come to
+## rest at the edge if the gate is slow. Where the release is near the speed is high and the braking distance clamp decides.
+func _gate_law() -> float:
+	var margin := safety + stop_distance(speed, max_accel * brake_fraction, max_jerk) + speed * margin_look
+	var gap := maxf(ready_filtered - margin, 0.0) # The release of a region is an event: the quick filter, not the loader's slow one
+	var eta := -1.0
+	if gate_eta.is_valid() and _gate_loc != null:
+		var e: Variant = gate_eta.call(_gate_loc)
+		if typeof(e) == TYPE_FLOAT or typeof(e) == TYPE_INT:
+			eta = float(e)
+	gate_eta_now = eta
+	var v := gap * gate_k
+	if eta > gate_eta_long:
+		v = minf(v, gap / eta) # Arrive at the edge when the region is released instead of resting there
+	return minf(v, max_speed)
+
+
 func step(delta: float, ready_distance: float = INF) -> void:
 	var dt := maxf(delta, 1e-4)
 	elapsed += dt
@@ -357,18 +415,27 @@ func step(delta: float, ready_distance: float = INF) -> void:
 			ready_filtered = predicted + (ready_distance - predicted) * (1.0 - exp(-dt / ready_tau))
 	if not is_inf(ready_filtered):
 		ready_soft = ready_filtered if is_inf(ready_soft) else lerpf(ready_soft - speed * dt, ready_filtered, 1.0 - exp(-dt / ready_soft_tau))
+	# The gate: is the first missing region ahead one the gate holds (and not one still loading)?
+	gate_blocked = gate_aware and limited and _gate_at < INF and _gate_at <= distance + ready_distance + gate_tol
+	gate_eta_now = -1.0
+	gate_target = INF
+	if gate_blocked:
+		gate_blocked_time += dt
+		if soft:
+			gate_target = _gate_law()
 	var a_prev := accel
 	var v_hard := target_speed()
-	var v_soft := soft_target()
+	var v_soft := gate_target if gate_blocked and soft else soft_target()
 	soft_speed = v_soft
 	var v_target := minf(v_hard, v_soft)
 	adapting = soft and v_soft < v_hard and v_soft < max_speed * 0.995
 	var ready_brake := INF if is_inf(ready_filtered) else speed_for_distance(ready_filtered - safety, max_accel * brake_fraction, max_jerk)
-	var loader_limited := soft and rate_valid and minf(v_soft, ready_brake) < max_speed * 0.97
+	# A front held by the gate is not the loader: no quality loss, no limit_seen
+	var loader_limited := soft and rate_valid and not gate_blocked and minf(v_soft, ready_brake) < max_speed * 0.97
 	limit_seen = limit_seen or loader_limited
 	if rate_valid:
 		rate_hold = rate_est if rate_hold <= 0.0 else lerpf(rate_hold, rate_est, 1.0 - exp(-dt / rate_hold_tau))
-	if soft and rate_valid and limited and _unsat_time >= 0.5:
+	if soft and rate_valid and limited and not gate_blocked and _unsat_time >= 0.5:
 		# The queue is not full although regions are missing: the loader is not the limit, probe upwards slowly
 		rate_est = minf(rate_est * (1.0 + 0.25 * dt), max_speed / cruise_fraction)
 	if soft:
@@ -380,6 +447,9 @@ func step(delta: float, ready_distance: float = INF) -> void:
 		# normally
 		var a_lim := max_accel * soft_decel_fraction if (v_target < speed or limit_seen) else max_accel
 		var j_soft := max_jerk * soft_jerk_fraction
+		if gate_blocked:
+			a_lim = max_accel * brake_fraction if v_target < speed else max_accel
+			j_soft = max_jerk if v_target < speed else max_jerk * gate_jerk_fraction
 		# Where the gentle jerk could not settle the speed at the target in time (it would overshoot by more than 15 %),
 		# the full jerk is used: a slow response to a quickly falling target would oscillate
 		var j_use := j_soft if (accel <= 0.0 or speed + accel * accel / (2.0 * j_soft) <= v_target * 1.15) else max_jerk

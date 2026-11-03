@@ -83,6 +83,60 @@ func _fly(g: FlightGovernor, length: float, amp: float, ready_fn: Callable, fron
 	return r
 
 
+## Flies against a gate: tiles of `tile` meters are released at release_fn(k) seconds (k = 0, 1, ...), the visible front is the end of the
+## contiguous released tiles, the nearest held tile is the next one. The loader is busy the whole time (saturated, loads ticking at
+## 30/s), which is what the old governor read as a slow loader. use_eta feeds gate_eta with the exact release time.
+func _fly_gate(g: FlightGovernor, length: float, tile: float, release_fn: Callable, use_eta: bool, observe: bool = true) -> Dictionary:
+	var h := _heights(length, 50.0, 40.0)
+	g.setup(length, h, 50.0, h[0], h[h.size() - 1])
+	var n_tiles := int(ceil(length / tile))
+	var clock := [0.0] # A lambda captures by value: the eta reads the clock through an array
+	var t := 0.0
+	var steps := 0
+	var r := {"arrive": -1.0, "time": -1.0, "qmin": 1.0, "rest_t": 0.0, "first_move": -1.0, "v_min_mid": INF, "v_end": 0.0, "peak_v": 0.0, "peak_a": 0.0, "peak_j": 0.0,
+			"margin": INF, "blocked_t": 0.0, "limit_seen": false, "v": [], "rate_valid": false, "t_last_release": 0.0}
+	if use_eta:
+		g.gate_eta = func(loc: Vector2i) -> float: return maxf(float(release_fn.call(loc.x)) - clock[0], 0.0)
+	while steps < 60 * 120:
+		var n := 0
+		while n < n_tiles and float(release_fn.call(n)) <= t:
+			n += 1
+		var front := tile * float(n) if n < n_tiles else length
+		var ready := minf(front - g.distance, length - g.distance)
+		if observe:
+			g.observe_gate(front if n < n_tiles else INF, Vector2i(n, 0))
+		g.observe_loader(DT, int(t * 30.0), true, 256.0)
+		g.step(DT, ready)
+		t += DT
+		clock[0] = t
+		steps += 1
+		r.qmin = minf(r.qmin, g.quality)
+		r.peak_v = maxf(r.peak_v, g.speed)
+		r.peak_a = maxf(r.peak_a, absf(g.accel))
+		r.peak_j = maxf(r.peak_j, absf(g.jerk))
+		if g.distance > 1.0 and r.first_move < 0.0:
+			r.first_move = t
+		if r.first_move >= 0.0 and g.distance < length - 0.5:
+			if g.speed < 5.0:
+				r.rest_t += DT
+			if g.distance > 0.15 * length and g.distance < 0.85 * length:
+				r.v_min_mid = minf(r.v_min_mid, g.speed)
+		if g.gate_blocked:
+			r.blocked_t += DT
+		if g.distance >= length - 0.5 and r.arrive < 0.0:
+			r.arrive = t
+		r.v.append(g.speed)
+		if g.is_done():
+			r.time = t
+			break
+	r.margin = g.min_ready_margin
+	r.limit_seen = g.limit_seen
+	r.rate_valid = g.rate_valid
+	r.v_end = g.speed
+	r.t_last_release = float(release_fn.call(n_tiles - 1))
+	return r
+
+
 ## Cruise at the cap plus half of the S-curve ramp up and half of the ramp down
 func _theory(g: FlightGovernor, length: float) -> float:
 	var a_end := g.max_accel * g.end_brake_fraction
@@ -303,6 +357,69 @@ func _initialize() -> void:
 	ok(rad_to_deg(max_dp) < 0.3, "attitude: no sudden orientation change (%.3f deg per frame)" % rad_to_deg(max_dp))
 	print("fov mid %.2f end %.2f, pitch end %.2f deg" % [ra.fov[ra.fov.size() / 2], ra.fov[ra.fov.size() - 1], rad_to_deg(ra.pitch[ra.pitch.size() - 1])])
 	ok(ra.fov[ra.fov.size() / 2] > g.base_fov + 4.0 and absf(ra.fov[ra.fov.size() - 1] - g.base_fov) < 1.0, "attitude: the field of view widens with speed and returns")
+
+
+	# 9. The insert gate. A gate releases 1 km tiles every 0.9 s from t = 2 s (1.1 km/s, the camera could do 2.5) while the loader
+	# is busy: the governor must not read the held tiles as a slow loader, and must slow smoothly for the visible edge
+	var rel_fn := func(k: int) -> float: return 0.0 if k < 2 else 2.0 + 0.9 * float(k - 2) + 0.3 * float(k % 3)
+	var gate_res := {}
+	for variant: String in ["old", "aware", "eta"]:
+		g = FlightGovernor.new()
+		g.gate_aware = variant != "old"
+		gate_res[variant] = _fly_gate(g, 10000.0, 1024.0, rel_fn, variant == "eta", variant != "old")
+		var gr: Dictionary = gate_res[variant]
+		var prof := ""
+		for i in range(0, gr.v.size(), 30):
+			prof += " %.0f" % gr.v[i]
+		print("   profile", prof)
+		print("gate steady %s: arrive %.2f s (last release %.2f), landed %.2f, quality min %.2f, limit_seen %s, rest %.2f s, min mid speed %.0f, blocked %.1f s, clamp hits %d, margin %.0f, peak a %.0f j %.0f" % [
+				variant, gr.arrive, gr.t_last_release, gr.time, gr.qmin, str(gr.limit_seen), gr.rest_t, gr.v_min_mid, gr.blocked_t, g.clamp_hits, gr.margin, gr.peak_a, gr.peak_j])
+	var go: Dictionary = gate_res["old"]
+	var ga: Dictionary = gate_res["aware"]
+	var ge: Dictionary = gate_res["eta"]
+	ok(go.qmin < 0.99, "gate: without gate awareness the held tiles degrade the footprint quality (%.2f), the defect" % go.qmin)
+	ok(ga.qmin == 1.0 and ge.qmin == 1.0, "gate: gate aware: the footprint quality stays at 1 (%.2f, with eta %.2f)" % [ga.qmin, ge.qmin])
+	ok(not ga.limit_seen and not ge.limit_seen, "gate: held tiles never mark the loader as limiting")
+	ok(ga.blocked_t > 2.0 and ge.blocked_t > 2.0, "gate: the front is recognised as held by the gate (%.1f s, with eta %.1f s)" % [ga.blocked_t, ge.blocked_t])
+	ok(ga.time > 0.0 and ge.time > 0.0 and ga.margin >= -0.5 and ge.margin >= -0.5, "gate: lands, never within the safety distance of the held tile (margin %.0f, with eta %.0f)" % [ga.margin, ge.margin])
+	ok(ga.arrive <= go.arrive + 0.3 and ge.arrive <= go.arrive + 0.3, "gate: gate aware arrival %.2f s (eta %.2f s) is not later than the unaware %.2f s" % [ga.arrive, ge.arrive, go.arrive])
+	ok(ga.arrive <= ga.t_last_release + 3.5 and ge.arrive <= ge.t_last_release + 3.5, "gate: arrives within 3.5 s of the last release (%.2f s, with eta %.2f s; last release %.2f s)" % [ga.arrive - ga.t_last_release, ge.arrive - ge.t_last_release, ga.t_last_release])
+	ok(ga.v_end == 0.0 and ga.peak_v <= g.max_speed * 1.001 and ga.peak_a <= g.max_accel * 1.001 and ga.peak_j <= g.max_jerk * 1.001, "gate: speed, acceleration and jerk within the limits (%.0f, %.0f, %.0f)" % [ga.peak_v, ga.peak_a, ga.peak_j])
+	ok(ge.v_min_mid > 0.15 * g.max_speed, "gate: with an eta the camera does not nearly stop mid-flight (slowest %.0f m/s of %.0f)" % [ge.v_min_mid, g.max_speed])
+	ok(ge.rest_t == 0.0, "gate: with an eta the camera does not rest mid-flight (%.2f s)" % ge.rest_t)
+	# Long holds: three tiles at a time every 3.5 s. The eta tells the camera the hold is long, it arrives at the edge when the tiles
+	# appear instead of coming to rest there early
+	var burst_fn := func(k: int) -> float: return 0.0 if k < 2 else 2.0 + 3.5 * float((k - 2) / 3)
+	var burst_res := {}
+	for variant: String in ["old", "aware", "eta"]:
+		g = FlightGovernor.new()
+		g.gate_aware = variant != "old"
+		burst_res[variant] = _fly_gate(g, 10000.0, 1024.0, burst_fn, variant == "eta", variant != "old")
+		var br: Dictionary = burst_res[variant]
+		print("gate bursts %s: arrive %.2f s (last release %.2f), landed %.2f, quality min %.2f, rest %.2f s, min mid speed %.0f, blocked %.1f s, clamp hits %d, margin %.0f" % [
+				variant, br.arrive, br.t_last_release, br.time, br.qmin, br.rest_t, br.v_min_mid, br.blocked_t, g.clamp_hits, br.margin])
+	var ba: Dictionary = burst_res["aware"]
+	var be: Dictionary = burst_res["eta"]
+	var bo: Dictionary = burst_res["old"]
+	ok(ba.qmin == 1.0 and be.qmin == 1.0 and bo.qmin < 1.0, "gate bursts: quality %.2f aware, %.2f with eta, %.2f unaware" % [ba.qmin, be.qmin, bo.qmin])
+	ok(ba.time > 0.0 and be.time > 0.0 and ba.margin >= -0.5 and be.margin >= -0.5, "gate bursts: lands, the held tiles are never closer than the safety distance (margin %.0f, with eta %.0f)" % [ba.margin, be.margin])
+	ok(be.rest_t <= ba.rest_t and be.v_min_mid >= ba.v_min_mid, "gate bursts: with an eta the camera rests no longer (%.2f s vs %.2f s) and its slowest speed is no lower (%.0f vs %.0f m/s)" % [be.rest_t, ba.rest_t, be.v_min_mid, ba.v_min_mid])
+	ok(be.arrive <= ba.arrive + 0.5, "gate bursts: and arrives at most 0.5 s later (%.2f s vs %.2f s)" % [be.arrive, ba.arrive])
+	# A loader that is slow is still a slow loader: a held tile is far beyond the missing region in front, so the front is not the gate's
+	g = FlightGovernor.new()
+	var rs2 := _fly(g, 10000.0, 40.0, Callable(), func(t: float) -> float: return 1500.0 + 500.0 * t)
+	ok(g.quality < 1.0 and rs2.time > 0.0, "gate: without a gate the slow loader still degrades the footprint (%.2f)" % g.quality)
+	g = FlightGovernor.new()
+	g.setup(10000.0, _heights(10000.0, 50.0, 40.0), 50.0, 0.0, 0.0)
+	g.observe_gate(8000.0, Vector2i(31, 0)) # A held tile 8 km along, the front is the loader's at 3 km
+	g.step(DT, 3000.0)
+	ok(not g.gate_blocked, "gate: a held tile far beyond the first missing region does not make the front a gate front")
+	g.observe_gate(3100.0, Vector2i(12, 0))
+	g.step(DT, 3000.0)
+	ok(g.gate_blocked and is_inf(g.gate_target) == false, "gate: a held tile at the front does")
+	g.gate_aware = false
+	g.step(DT, 3000.0)
+	ok(not g.gate_blocked, "gate: gate_aware = false turns it off")
 
 	print("SUITE ", "GREEN" if _fail == 0 else "RED (%d failures)" % _fail)
 	quit(0 if _fail == 0 else 1)
