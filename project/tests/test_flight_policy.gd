@@ -166,7 +166,7 @@ func _pct(a: Array, p: float) -> float:
 func _base_cfg() -> Dictionary:
 	return {"label": "", "rs": 512, "length": 10000.0, "governed": true, "soft": true, "cap": -1.0, "conc": 3, "lpf": 1, "budget": 2.0, "slots": 160,
 			"prefetch": true, "ram_budget": 3.0e9, "lookahead": true, "collision": "off", "csv": false, "timeout": 150.0, "expect_zero": true,
-			"gate": {}, "gov": {}}
+			"gate": {}, "gov": {}, "hz": 60, "ring": true}
 
 
 func _run() -> void:
@@ -208,6 +208,13 @@ func _run() -> void:
 		# An artificially slowed loader: a 0.05 ms budget lets only one upload step of one region run per frame
 		plan.append(_cfg(b, "%d m 10 km v2 soft, one upload step per frame" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "timeout": 400.0}))
 		plan.append(_cfg(b, "%d m 10 km v1 hard clamp, one upload step per frame" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "soft": false, "timeout": 400.0}))
+		# The same at 40 physics frames a second: the loader's rate falls with the frame rate to ~330 m/s at 256 m, below the soft law's
+		# floor of 0.3 x the cap (750 m/s) as on the demo GPU (~360 m/s)
+		plan.append(_cfg(b, "%d m 10 km v2 soft, one upload step per frame at 40 Hz" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "timeout": 400.0, "hz": 40}))
+		plan.append(_cfg(b, "%d m 10 km v1 hard clamp, one upload step per frame at 40 Hz" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "soft": false, "timeout": 400.0, "hz": 40}))
+		# The same without the destination ring (which takes the load queue from the corridor for a few seconds), to see the floor alone
+		plan.append(_cfg(b, "%d m 10 km v2 soft, one upload step per frame at 40 Hz, no ring" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "timeout": 400.0, "hz": 40, "ring": false}))
+		plan.append(_cfg(b, "%d m 10 km v1 hard clamp, one upload step per frame at 40 Hz, no ring" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "soft": false, "timeout": 400.0, "hz": 40, "ring": false}))
 	# The insert gate: a fake tree streamer holds 1 km tiles until 2..4 s after the streamer first asks about them. The governor must
 	# slow for the visible edge without reading the held regions as a slow loader. Loaders as the demo clips (conc 8, 4 per frame, 4 ms)
 	for rs: int in sizes:
@@ -374,6 +381,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	var start := Vector2(0.5 * sp, 0.5 * sp)
 	var dest := start + Vector2(length, 0)
 	cam.global_position = Vector3(start.x, 120, start.y)
+	Engine.physics_ticks_per_second = int(cfg.hz)
 	var gate_on: bool = not cfg.gate.is_empty()
 	if gate_on:
 		_tile_ready_at.clear()
@@ -472,7 +480,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			"first_ring": -1.0, "act": -1.0, "corridor_done": -1.0, "wanted_behind": 0, "ring_early": 0, "order_violations": 0,
 			"ring_missing": -1, "ring_whole": -1, "ring_check": false, "lead_dist_min": INF, "lead_t_min": INF, "late_inserts": 0, "recentres": 0, "recentre_log": [], "wanted_missing": -1, "landed_start": s.get_stats().landed_total, "tick_ms": [], "phys_ms": [],
 			"wanted_max": 0, "missing_max": 0, "restore_ms": 0.0, "post_tick_max": 0.0, "col_refreshes": 0, "col_start": 0, "classes": {"near": 0, "cache": 0, "ring": 0}}
-	var gm := {"first_move": -1.0, "rest_t": 0.0, "episode": 0.0, "episodes": [], "gated_max": 0, "timeouts": 0, "wait_max": 0, "blocked_t": 0.0, "profile": []}
+	var gm := {"first_move": -1.0, "rest_t": 0.0, "episode": 0.0, "episodes": [], "episode_at": [], "gated_max": 0, "timeouts": 0, "wait_max": 0, "blocked_t": 0.0, "profile": [], "q_first": -1.0, "q_half": -1.0}
 	var next_profile := 0.0
 	var csv := PackedStringArray(["t,distance,speed,accel,jerk,altitude,ground,climb_speed,pitch_deg,fov,ready,resident,wanted,missing,tick_ms,quality,gated,gate_blocked"])
 	var seen := {}
@@ -551,6 +559,8 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			gm.first_move = t
 		if gm.first_move >= 0.0 and g.length - g.distance > 0.5:
 			if g.speed < 5.0:
+				if gm.episode == 0.0:
+					gm.episode_at.append(g.distance / g.length)
 				gm.rest_t += dt
 				gm.episode += dt
 			elif gm.episode > 0.0:
@@ -562,6 +572,10 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			gm.wait_max = st.get("gate_wait_ms_max", 0)
 		if g.get("gate_blocked") == true:
 			gm.blocked_t += dt
+		if g.quality < 0.99 and gm.q_first < 0.0:
+			gm.q_first = t
+		if g.quality <= 0.5 and gm.q_half < 0.0:
+			gm.q_half = t
 		if t >= next_profile and m.arrive < 0.0:
 			gm.profile.append("%.1f:%.0f" % [t, g.speed])
 			next_profile += 0.5
@@ -695,7 +709,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 				if ring.has(loc) and m.first_ring < 0.0:
 					m.first_ring = t
 		# Destination activation: the corridor is complete, or the time to arrival drops below T_act
-		if not activated and cfg.lookahead:
+		if not activated and cfg.lookahead and cfg.ring:
 			if m.ticks % 6 == 0 and m.corridor_done < 0.0:
 				var have := _locs(s.get_cached_regions())
 				var cdone := true
@@ -743,7 +757,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 					ring_ready = false
 					break
 		for loc in ring_all:
-			if not _t.data.has_region(loc):
+			if cfg.ring and not _t.data.has_region(loc):
 				ring_ready = false
 				break
 		if csv.size() < 100000 and cfg.csv:
@@ -759,7 +773,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			m.wanted_missing = left
 			var rleft := 0
 			for loc in ring_all:
-				rleft += 0 if _t.data.has_region(loc) else 1
+				rleft += 0 if _t.data.has_region(loc) or not cfg.ring else 1
 			m.ring_missing = rleft
 			if not governed:
 				m.classes_missing = _classify_missing(s, ring_all)
@@ -834,7 +848,11 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	m["rest_t"] = gm.rest_t
 	m["rest_longest"] = longest
 	m["rests"] = gm.episodes.size()
-	row += " | take-off hover %.2f s, mid-flight rests %d (%.2f s, longest %.2f s)" % [gm.first_move, gm.episodes.size(), gm.rest_t, longest]
+	row += " | take-off hover %.2f s, mid-flight rests %d (%.2f s, longest %.2f s), quality below 0.99 at %.2f s, at 0.5 at %.2f s" % [gm.first_move, gm.episodes.size(), gm.rest_t, longest, gm.q_first, gm.q_half]
+	var at_txt: Array[String] = []
+	for i in gm.episodes.size():
+		at_txt.append("%.2f s at %.0f%%" % [gm.episodes[i], 100.0 * gm.episode_at[i]])
+	row += " | rests at " + ", ".join(at_txt)
 	if gate_on:
 		row += " | gate: gated max %d, timeouts %d, wait max %d ms, blocked %.1f s, asks %d" % [gm.gated_max, gm.timeouts, gm.wait_max, gm.blocked_t, _gate_calls]
 		print("PROFILE ", cfg.label, " (t:m/s every 0.5 s) ", " ".join(gm.profile))
@@ -880,6 +898,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	s.behind_limit = -1.0
 	if gate_on:
 		s.set_insert_gate(Callable())
+	Engine.physics_ticks_per_second = 60
 	cam.queue_free()
 	_t.queue_free()
 	await _frames(3)

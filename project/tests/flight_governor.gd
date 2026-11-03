@@ -70,7 +70,8 @@ var ready_soft_tau := 1.2 ## s, time constant of the slower ready distance the s
 var soft_decel_fraction := 0.35 ## of max_accel while adapting
 var soft_jerk_fraction := 0.3 ## of max_jerk while adapting
 var cruise_fraction := 0.88 ## cruise speed as a share of the measured sustainable rate
-var floor_fraction := 0.3 ## the soft law never asks for less than this share of the cap
+var floor_fraction := 0.3 ## the soft law never asks for less than this share of the cap ...
+var floor_rate_fraction := 1.0 ## ... nor than this share of the sustainable rate when the loader is slower than the floor (adaptive floor; 0.8 gives the same flight 2 s slower, 1.2 and above hunts again)
 var margin_look := 0.25 ## s of travel kept as a buffer on top of safety and the stopping distance
 var rate_tau := 2.0 ## s, time constant of a rise of the sustainable rate estimate (low bandwidth)
 var rate_tau_down := 0.7 ## s, time constant of a fall (a loader that slows is believed sooner than one that speeds up)
@@ -362,15 +363,19 @@ func soft_target() -> float:
 	# Until a throughput sample exists (the loader was never saturated) the braking clamp alone limits the speed
 	if not soft or not rate_valid:
 		return INF
+	var rate := rate_hold if rate_hold > 0.0 else rate_est
+	# The floor is a share of the cap, but never above a share of what the loader can sustain: a loader slower than the floor
+	# could not hold it and the camera would stop for the braking clamp
+	var floor_v := minf(floor_fraction * max_speed, floor_rate_fraction * rate)
 	# Once the loader has limited the flight the speed is held at a share of its rate when everything ahead is
 	# loaded, so the flight is one smooth profile and does not speed up at the end
 	if is_inf(ready_soft):
-		return clampf(cruise_fraction * rate_hold, floor_fraction * max_speed, max_speed) if limit_seen else INF
+		return clampf(cruise_fraction * rate, floor_v, max_speed) if limit_seen else INF
 	# A healthy buffer (ready above the margin) lets the speed exceed the measured disk rate: regions that come from
 	# the RAM cache do not advance the front by disk loads, so the rate is a floor of the throughput, not a ceiling
 	var margin := safety + stop_distance(speed, max_accel * brake_fraction, max_jerk) + speed * margin_look
-	var v := rate_hold * 0.95 + soft_k * (ready_soft - margin)
-	return clampf(v, floor_fraction * max_speed, max_speed)
+	var v := rate * 0.95 + soft_k * (ready_soft - margin)
+	return clampf(v, floor_v, max_speed)
 
 
 ## The speed from which the camera reaches the edge of the visible terrain (ready less the margin) when the gate releases the

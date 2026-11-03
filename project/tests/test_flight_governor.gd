@@ -241,6 +241,57 @@ func _initialize() -> void:
 		ok(sr.adapt_a <= g.max_accel * 1.001 and sr.adapt_j <= g.max_jerk * 0.3 * 1.05 + 1.0 or true, "soft %.0f m/s loader: adaptation peak accel %.0f jerk %.0f" % [rate, sr.adapt_a, sr.adapt_j])
 		ok(sr.wobble <= 0.06 * g.max_accel, "soft %.0f m/s loader: speed wobble (std of dv/dt) %.0f m/s^2 is small against the %.0f limit" % [rate, sr.wobble, g.max_accel])
 
+	# 4c. A loader slower than the floor (0.3 x the cap = 750 m/s): the soft law cannot hold a floor above what the loader sustains, the
+	# braking clamp decides and the speed hunts (v2). The adaptive floor min(0.3 x cap, floor_rate_fraction x the measured rate) follows the
+	# loader instead. First the floor itself, then flights with a loader that lands a 256 m region at a time.
+	g = FlightGovernor.new()
+	g.setup(10000.0, _heights(10000.0, 50.0, 40.0), 50.0, 0.0, 0.0)
+	g.rate_valid = true
+	g.rate_est = 360.0
+	g.rate_hold = 360.0
+	g.ready_soft = 700.0 # Less than the margin: the law wants less than the loader's rate
+	g.ready_filtered = 700.0
+	ok(g.soft_target() >= 360.0 - 1.0 and g.soft_target() < 420.0, "floor: the soft target follows a 360 m/s loader, not the 750 m/s floor (%.0f m/s)" % g.soft_target())
+	g.floor_rate_fraction = 1.0e9
+	ok(absf(g.soft_target() - 750.0) < 1.0, "floor: with the v2 floor it asks for 750 m/s, twice what the loader sustains (%.0f)" % g.soft_target())
+	g.rate_est = 3000.0
+	g.rate_hold = 3000.0
+	g.floor_rate_fraction = 1.0
+	ok(g.soft_target() >= 0.3 * g.max_speed, "floor: a fast loader keeps the 0.3 x cap floor (%.0f)" % g.soft_target())
+	for rate: float in [250.0, 360.0, 600.0]:
+		var fres := {}
+		for adaptive: bool in [false, true]:
+			g = FlightGovernor.new()
+			g.floor_rate_fraction = 1.0 if adaptive else 1.0e9 # 1e9: the floor is always 0.3 x the cap, the v2 behaviour
+			var rf := _fly(g, 10000.0, 40.0, Callable(), func(t: float) -> float: return 1500.0 + 256.0 * floorf(rate * t / 256.0))
+			var rest := 0.0
+			var vmin := INF
+			var vmax := 0.0
+			var wob2: Array[float] = []
+			for i in range(1, rf.s.size()):
+				if rf.s[i] > 2500.0 and rf.s[i] < 7500.0:
+					rest += DT if rf.v[i] < 5.0 else 0.0
+					vmin = minf(vmin, rf.v[i])
+					vmax = maxf(vmax, rf.v[i])
+					wob2.append((rf.v[i] - rf.v[i - 1]) / DT)
+			var mean2 := 0.0
+			for w in wob2:
+				mean2 += w
+			mean2 /= maxf(wob2.size(), 1)
+			var sd2 := 0.0
+			for w in wob2:
+				sd2 += (w - mean2) * (w - mean2)
+			sd2 = sqrt(sd2 / maxf(wob2.size(), 1))
+			fres[adaptive] = {"rest": rest, "vmin": vmin, "vmax": vmax, "arrive": rf.arrive, "time": rf.time, "wobble": sd2, "clamp": g.clamp_hits, "margin": rf.margin, "est": g.rate_est}
+		var fa: Dictionary = fres[true]
+		var fo: Dictionary = fres[false]
+		print("floor, stepped loader %.0f m/s: ADAPTIVE rest %.2f s, speed %.0f..%.0f (%.2f of the top), arrive %.2f s, wobble %.0f, clamp hits %d, margin %.0f, rate est %.0f | v2 FLOOR rest %.2f s, speed %.0f..%.0f (%.2f), arrive %.2f s, wobble %.0f, clamp hits %d" % [
+				rate, fa.rest, fa.vmin, fa.vmax, fa.vmin / maxf(fa.vmax, 1.0), fa.arrive, fa.wobble, fa.clamp, fa.margin, fa.est, fo.rest, fo.vmin, fo.vmax, fo.vmin / maxf(fo.vmax, 1.0), fo.arrive, fo.wobble, fo.clamp])
+		ok(fa.time > 0.0 and fa.rest == 0.0, "floor: stepped loader %.0f m/s: the camera never stops mid-flight with the adaptive floor (%.2f s at rest; the v2 floor %.2f s)" % [rate, fa.rest, fo.rest])
+		ok(fa.vmin >= 0.5 * fa.vmax, "floor: stepped loader %.0f m/s: speed stays within 50%% of the cruise (min %.0f of %.0f)" % [rate, fa.vmin, fa.vmax])
+		ok(fa.clamp == 0 and fa.margin >= -0.5, "floor: stepped loader %.0f m/s: no failsafe clamp, margin %.0f m" % [rate, fa.margin])
+		ok(fa.arrive <= fo.arrive * 1.2, "floor: stepped loader %.0f m/s: arrival %.2f s is within 20%% of the v2 floor's %.2f s" % [rate, fa.arrive, fo.arrive])
+
 	# 5. Regions land in 256 m steps (the ready distance jumps), every 0.25 s: no twitching
 	g = FlightGovernor.new()
 	var rj := _fly(g, 10000.0, 40.0, Callable(), func(t: float) -> float: return 1500.0 + 256.0 * floorf(t / 0.25))
