@@ -17,7 +17,7 @@ var _root_dir := "user://flight_policy_%d" % OS.get_process_id()
 var _args := {}
 var _worlds := {}
 var _rows: Array[String] = []
-var _csv_dir := "E:/Terrain3D_fork/private/research/bench/flight-policy"
+var _csv_dir := "user://flight_policy_csv"
 # Fake tree streamer for the insert gate scenarios: a tile of gate_tile x gate_tile regions is requested the first time the streamer
 # asks the gate about one of its regions and reports ready gate_min..gate_max seconds later (deterministic per tile)
 var _gate_tile := 4
