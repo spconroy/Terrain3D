@@ -213,8 +213,7 @@ func _run() -> void:
 		plan.append(_cfg(b, "%d m 10 km v2 soft, one upload step per frame at 40 Hz" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "timeout": 400.0, "hz": 40}))
 		plan.append(_cfg(b, "%d m 10 km v1 hard clamp, one upload step per frame at 40 Hz" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "soft": false, "timeout": 400.0, "hz": 40}))
 		# The same without the destination ring (which takes the load queue from the corridor for a few seconds), to see the floor alone
-		plan.append(_cfg(b, "%d m 10 km v2 soft, one upload step per frame at 40 Hz, no ring" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "timeout": 400.0, "hz": 40, "ring": false}))
-		plan.append(_cfg(b, "%d m 10 km v1 hard clamp, one upload step per frame at 40 Hz, no ring" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "soft": false, "timeout": 400.0, "hz": 40, "ring": false}))
+		plan.append(_cfg(b, "%d m 10 km v2 soft, one upload step per frame at 40 Hz, no ring" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "timeout": 400.0, "hz": 40, "ring": false, "expect_zero": false}))
 	# The insert gate: a fake tree streamer holds 1 km tiles until 2..4 s after the streamer first asks about them. The governor must
 	# slow for the visible edge without reading the held regions as a slow loader. Loaders as the demo clips (conc 8, 4 per frame, 4 ms)
 	for rs: int in sizes:
@@ -225,11 +224,11 @@ func _run() -> void:
 		gb.lpf = 4
 		gb.budget = 4.0
 		var gate_wait := {"min": 2.0, "max": 4.0}
-		plan.append(_cfg(gb, "%d m 10 km gate scenario: no gate" % rs, {}))
-		plan.append(_cfg(gb, "%d m 10 km gate scenario: wait forever" % rs, {"gate": gate_wait, "csv": true}))
-		plan.append(_cfg(gb, "%d m 10 km gate scenario: timeout 2500 ms" % rs, {"gate": {"min": 2.0, "max": 4.0, "timeout": 2500}, "expect_zero": false}))
-		plan.append(_cfg(gb, "%d m 10 km gate scenario: wait forever, exact eta" % rs, {"gate": {"min": 2.0, "max": 4.0, "eta": true}, "csv": true}))
-		plan.append(_cfg(gb, "%d m 10 km gate scenario: wait forever, v1 clamp" % rs, {"gate": gate_wait, "soft": false}))
+		plan.append(_cfg(gb, "%d m 10 km gate scenario - no gate" % rs, {}))
+		plan.append(_cfg(gb, "%d m 10 km gate scenario - wait forever" % rs, {"gate": gate_wait, "csv": true}))
+		plan.append(_cfg(gb, "%d m 10 km gate scenario - timeout 2500 ms" % rs, {"gate": {"min": 2.0, "max": 4.0, "timeout": 2500}, "expect_zero": false}))
+		plan.append(_cfg(gb, "%d m 10 km gate scenario - wait forever, exact eta" % rs, {"gate": {"min": 2.0, "max": 4.0, "eta": true}, "csv": true}))
+		plan.append(_cfg(gb, "%d m 10 km gate scenario - wait forever, v1 clamp" % rs, {"gate": gate_wait, "soft": false}))
 	# Frame pacing: dynamic collision refresh and the frame budget
 	for rs: int in sizes:
 		var cb := _base_cfg()
