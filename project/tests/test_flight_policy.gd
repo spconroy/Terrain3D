@@ -18,6 +18,13 @@ var _args := {}
 var _worlds := {}
 var _rows: Array[String] = []
 var _csv_dir := "E:/Terrain3D_fork/private/research/bench/flight-policy"
+# Fake tree streamer for the insert gate scenarios: a tile of gate_tile x gate_tile regions is requested the first time the streamer
+# asks the gate about one of its regions and reports ready gate_min..gate_max seconds later (deterministic per tile)
+var _gate_tile := 4
+var _gate_min := 2.0
+var _gate_max := 4.0
+var _tile_ready_at := {}
+var _gate_calls := 0
 
 
 func ok(c: bool, m: String) -> void:
@@ -89,6 +96,33 @@ func _world(rs: int) -> Dictionary:
 	return _worlds[rs]
 
 
+func _gate_now() -> float:
+	return float(Time.get_ticks_usec()) * 1.0e-6
+
+
+func _tile_of(loc: Vector2i) -> Vector2i:
+	return Vector2i(floori(float(loc.x) / float(_gate_tile)), floori(float(loc.y) / float(_gate_tile)))
+
+
+## The insert gate: the first question about a tile starts its clock; true once it is ready
+func _tree_gate(loc: Vector2i) -> bool:
+	_gate_calls += 1
+	var tile := _tile_of(loc)
+	var now := _gate_now()
+	if not _tile_ready_at.has(tile):
+		var h := fposmod(sin(float(tile.x) * 12.9898 + float(tile.y) * 78.233) * 43758.5453, 1.0)
+		_tile_ready_at[tile] = now + _gate_min + (_gate_max - _gate_min) * h
+	return now >= float(_tile_ready_at[tile])
+
+
+## What the game would tell the governor: seconds until the tile of this region is ready
+func _tree_eta(loc: Vector2i) -> float:
+	var tile := _tile_of(loc)
+	if not _tile_ready_at.has(tile):
+		return -1.0
+	return maxf(float(_tile_ready_at[tile]) - _gate_now(), 0.0)
+
+
 func _new_terrain(w: Dictionary, cfg: Dictionary) -> Camera3D:
 	_t = Terrain3D.new()
 	_t.streaming_enabled = true
@@ -131,7 +165,8 @@ func _pct(a: Array, p: float) -> float:
 
 func _base_cfg() -> Dictionary:
 	return {"label": "", "rs": 512, "length": 10000.0, "governed": true, "soft": true, "cap": -1.0, "conc": 3, "lpf": 1, "budget": 2.0, "slots": 160,
-			"prefetch": true, "ram_budget": 3.0e9, "lookahead": true, "collision": "off", "csv": false, "timeout": 150.0, "expect_zero": true}
+			"prefetch": true, "ram_budget": 3.0e9, "lookahead": true, "collision": "off", "csv": false, "timeout": 150.0, "expect_zero": true,
+			"gate": {}, "gov": {}}
 
 
 func _run() -> void:
@@ -173,6 +208,21 @@ func _run() -> void:
 		# An artificially slowed loader: a 0.05 ms budget lets only one upload step of one region run per frame
 		plan.append(_cfg(b, "%d m 10 km v2 soft, one upload step per frame" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "timeout": 400.0}))
 		plan.append(_cfg(b, "%d m 10 km v1 hard clamp, one upload step per frame" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "soft": false, "timeout": 400.0}))
+	# The insert gate: a fake tree streamer holds 1 km tiles until 2..4 s after the streamer first asks about them. The governor must
+	# slow for the visible edge without reading the held regions as a slow loader. Loaders as the demo clips (conc 8, 4 per frame, 4 ms)
+	for rs: int in sizes:
+		var gb := _base_cfg()
+		gb.rs = rs
+		gb.slots = big_slots[rs]
+		gb.conc = 8
+		gb.lpf = 4
+		gb.budget = 4.0
+		var gate_wait := {"min": 2.0, "max": 4.0}
+		plan.append(_cfg(gb, "%d m 10 km gate scenario: no gate" % rs, {}))
+		plan.append(_cfg(gb, "%d m 10 km gate scenario: wait forever" % rs, {"gate": gate_wait, "csv": true}))
+		plan.append(_cfg(gb, "%d m 10 km gate scenario: timeout 2500 ms" % rs, {"gate": {"min": 2.0, "max": 4.0, "timeout": 2500}, "expect_zero": false}))
+		plan.append(_cfg(gb, "%d m 10 km gate scenario: wait forever, exact eta" % rs, {"gate": {"min": 2.0, "max": 4.0, "eta": true}, "csv": true}))
+		plan.append(_cfg(gb, "%d m 10 km gate scenario: wait forever, v1 clamp" % rs, {"gate": gate_wait, "soft": false}))
 	# Frame pacing: dynamic collision refresh and the frame budget
 	for rs: int in sizes:
 		var cb := _base_cfg()
@@ -318,7 +368,17 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	var start := Vector2(0.5 * sp, 0.5 * sp)
 	var dest := start + Vector2(length, 0)
 	cam.global_position = Vector3(start.x, 120, start.y)
-	for i in 600:
+	var gate_on: bool = not cfg.gate.is_empty()
+	if gate_on:
+		_tile_ready_at.clear()
+		_gate_calls = 0
+		_gate_tile = int(round(1024.0 / sp))
+		_gate_min = cfg.gate.get("min", 2.0)
+		_gate_max = cfg.gate.get("max", 4.0)
+		s.set_insert_gate(_tree_gate)
+		s.gate_timeout_ms = int(cfg.gate.get("timeout", 0))
+	var settle_t0 := _gate_now()
+	for i in 600 if not gate_on else 100000:
 		await _frames(1)
 		var done := true
 		for dy in range(-2, 3):
@@ -327,9 +387,15 @@ func _fly(cfg: Dictionary) -> Dictionary:
 					done = false
 		if done and s.get_stats().staged == 0:
 			break
+		if gate_on and _gate_now() - settle_t0 > 20.0:
+			break
 	# The plan: cruise altitude from the terrain profile, the sharp footprint from it, corridor from the footprint
 	var g := FlightGovernor.new()
 	g.soft = cfg.soft
+	for k: String in cfg.gov:
+		g.set(k, cfg.gov[k])
+	if gate_on and cfg.gate.get("eta", false):
+		g.set("gate_eta", _tree_eta)
 	if cfg.cap > 0.0:
 		g.auto_cap = false
 		g.max_speed = cfg.cap
@@ -400,7 +466,9 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			"first_ring": -1.0, "act": -1.0, "corridor_done": -1.0, "wanted_behind": 0, "ring_early": 0, "order_violations": 0,
 			"ring_missing": -1, "ring_whole": -1, "ring_check": false, "lead_dist_min": INF, "lead_t_min": INF, "late_inserts": 0, "recentres": 0, "recentre_log": [], "wanted_missing": -1, "landed_start": s.get_stats().landed_total, "tick_ms": [], "phys_ms": [],
 			"wanted_max": 0, "missing_max": 0, "restore_ms": 0.0, "post_tick_max": 0.0, "col_refreshes": 0, "col_start": 0, "classes": {"near": 0, "cache": 0, "ring": 0}}
-	var csv := PackedStringArray(["t,distance,speed,accel,jerk,altitude,ground,climb_speed,pitch_deg,fov,ready,resident,wanted,missing,tick_ms"])
+	var gm := {"first_move": -1.0, "rest_t": 0.0, "episode": 0.0, "episodes": [], "gated_max": 0, "timeouts": 0, "wait_max": 0, "blocked_t": 0.0, "profile": []}
+	var next_profile := 0.0
+	var csv := PackedStringArray(["t,distance,speed,accel,jerk,altitude,ground,climb_speed,pitch_deg,fov,ready,resident,wanted,missing,tick_ms,quality,gated,gate_blocked"])
 	var seen := {}
 	var col_insert := {} # Column x -> [time inserted, meters ahead of the camera then]
 	var col_reach := {}
@@ -431,6 +499,23 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		var remaining := length - g.distance
 		var ready := s.get_path_ready_distance(path_id)
 		if governed:
+			if gate_on and g.has_method("observe_gate"):
+				# The nearest held region the corridor needs: where along the route it enters the corridor
+				var held_at := INF
+				var held_loc = null
+				var cam_x := start.x + g.distance
+				for gloc: Vector2i in s.get_gated_regions():
+					var gmn := Vector2(gloc) * sp
+					if gmn.x + sp < cam_x:
+						continue
+					var glat := maxf(maxf(gmn.y - start.y, start.y - (gmn.y + sp)), 0.0)
+					if glat > radius_q + 1.0:
+						continue
+					var at := maxf(gmn.x - start.x, g.distance)
+					if at < held_at:
+						held_at = at
+						held_loc = gloc
+				g.call("observe_gate", held_at, held_loc)
 			var saturated: bool = st.inflight >= cfg.conc
 			# With the whole route prefetched, near regions are inserted from the cache: the sustainable rate is the insertion rate
 			g.observe_loader(dt, int(st.landed_total if prefetch_all else st.disk_loads_needed), saturated, mpl_now)
@@ -456,6 +541,24 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		else:
 			g.step(dt, INF)
 		t += dt
+		if g.distance > 1.0 and gm.first_move < 0.0:
+			gm.first_move = t
+		if gm.first_move >= 0.0 and g.length - g.distance > 0.5:
+			if g.speed < 5.0:
+				gm.rest_t += dt
+				gm.episode += dt
+			elif gm.episode > 0.0:
+				gm.episodes.append(gm.episode)
+				gm.episode = 0.0
+		if gate_on:
+			gm.gated_max = maxi(gm.gated_max, st.get("gated", 0))
+			gm.timeouts = st.get("gate_timeouts", 0)
+			gm.wait_max = st.get("gate_wait_ms_max", 0)
+		if g.get("gate_blocked") == true:
+			gm.blocked_t += dt
+		if t >= next_profile and m.arrive < 0.0:
+			gm.profile.append("%.1f:%.0f" % [t, g.speed])
+			next_profile += 0.5
 		var pos := start + Vector2(g.distance, 0)
 		cam.global_position = Vector3(pos.x, g.altitude, pos.y)
 		cam.basis = Basis(Vector3.UP, -PI / 2.0) * Basis(Vector3.RIGHT, g.pitch)
@@ -640,6 +743,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		if csv.size() < 100000 and cfg.csv:
 			csv.append("%.4f,%.2f,%.2f,%.1f,%.0f,%.2f,%.2f,%.2f,%.3f,%.2f,%.1f,%d,%d,%d,%.2f" % [t, g.distance, g.speed, g.accel, g.jerk, g.altitude,
 					_ground(g.distance), g.climb_speed, rad_to_deg(g.pitch), g.fov, ready if ready < remaining - 1.0 else -1.0, st.resident, st.wanted, st.missing, wall_dt * 1000.0])
+			csv[csv.size() - 1] += ",%.3f,%d,%d" % [g.quality, st.get("gated", 0), 1 if g.get("gate_blocked") == true else 0]
 		if done_t < 0.0 and g.is_done(ring_ready if governed else true):
 			done_t = t
 			m.complete = t
@@ -715,6 +819,19 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	var actual_rate := front_adv / sat_time if sat_time > 0.3 else -1.0
 	row += " | v2: cap %.0f cruise %.0f min speed %.2f of cruise (%.2f including the destination phase), wobble %.0f, adapt a %.0f j %.0f (%d frames, %d above 0.3 x the jerk limit), quality min %.2f, lost %.1f s vs cap flight, rate est (mean before the destination) %.0f / actual front advance %.0f m/s" % [
 			g.max_speed, cruise, m.min_frac, m.min_frac_all, wob, m.adapt_a, m.adapt_j, m.adapt_frames, m.adapt_j_over, m.quality_min, m.arrive - theory, est_sum / maxf(float(est_n), 1.0) if est_n > 0 else -1.0, actual_rate]
+	if gm.episode > 0.0:
+		gm.episodes.append(gm.episode)
+	var longest := 0.0
+	for e: float in gm.episodes:
+		longest = maxf(longest, e)
+	m["hover"] = gm.first_move
+	m["rest_t"] = gm.rest_t
+	m["rest_longest"] = longest
+	m["rests"] = gm.episodes.size()
+	row += " | take-off hover %.2f s, mid-flight rests %d (%.2f s, longest %.2f s)" % [gm.first_move, gm.episodes.size(), gm.rest_t, longest]
+	if gate_on:
+		row += " | gate: gated max %d, timeouts %d, wait max %d ms, blocked %.1f s, asks %d" % [gm.gated_max, gm.timeouts, gm.wait_max, gm.blocked_t, _gate_calls]
+		print("PROFILE ", cfg.label, " (t:m/s every 0.5 s) ", " ".join(gm.profile))
 	if m.has("classes_missing"):
 		row += " | missing at arrival: " + str(m.classes_missing)
 	if cfg.collision != "off":
@@ -755,6 +872,8 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			f.close()
 	s.clear_keep()
 	s.behind_limit = -1.0
+	if gate_on:
+		s.set_insert_gate(Callable())
 	cam.queue_free()
 	_t.queue_free()
 	await _frames(3)
