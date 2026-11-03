@@ -32,6 +32,11 @@ extends RefCounted
 ##   sample, no quality loss) and the camera approaches the edge of the visible terrain smoothly. Set gate_eta (Callable(location)
 ##   -> seconds until it is released, <0 unknown) if the game knows the release time: the camera then arrives at the edge just
 ##   when the region becomes visible instead of stopping there.
+##   With lazily generated regions (Terrain3DStreamer pending locations, a background generator) call g.observe_generation(delta,
+##   regions_notified_total, st.generating_wanted, metres_per_region, held_at, location) instead of observe_gate(): held_at is where the
+##   nearest wanted pending region (get_wanted_pending()) enters the corridor, metres_per_region = region size / (regions + generating of
+##   get_path_cost() per column). The camera then tracks the generator's measured throughput (see GENERATION below), and generation lag is
+##   not read as a slow loader. Optional generation_eta (Callable(location) -> seconds until it is generated and visible, <0 unknown).
 ##   then place the camera at path(g.distance) with g.altitude, g.pitch and g.fov, and hold the landing
 ##   (keep hovering) until the destination is loaded: g.is_done(destination_loaded).
 ##
@@ -162,6 +167,36 @@ var gate_blocked_time := 0.0 ## Total time the front was held by the gate
 var _gate_at := INF
 var _gate_loc = null
 
+## GENERATION. A corridor of lazily generated regions (Terrain3DStreamer pending locations, a background generator in the game) is
+## limited by a third thing, neither the loader nor a gate: the generator, which delivers a trickle, not releases that come together.
+## While the first missing region ahead is one the generator still has to make (gen_blocked) the loader's metrics are left alone (no
+## rate sample, no probing, no quality loss: generation lag is not a slow loader) and the speed follows the generation law: the
+## generator's measured throughput along the path (regions finished per second x meters of path per region, the same estimator as the
+## loader's) plus gen_k x the visible terrain above the margin, so the camera tracks the generator's front without degrading the
+## footprint, unless the generator cannot keep up with the cruise (gen_degrade_fraction): then a smaller corridor needs fewer regions per
+## meter of path, as for a loader. As long as the generator is never behind (fewer than gen_queue_min wanted regions waiting) no throughput is measured and
+## nothing limits the speed but the braking distance clamp, which stays underneath as the failsafe. generation_eta (Callable(location)
+## -> seconds until the region is generated and visible, <0 unknown) is optional: a front further away than gate_eta_long is
+## approached so that the camera arrives at the edge when the region appears.
+var gen_aware := true
+var generation_eta := Callable()
+var gen_queue_min := 4 ## wanted pending regions the generator has queued before a throughput sample counts as what it can do (its worker count)
+var gen_fraction := 0.95 ## share of the measured generator rate the camera follows when its front is at the margin
+var gen_degrade_fraction := 0.9 ## the footprint quality falls only while the generation law asks for less than this share of the cap
+var gen_k := 0.3 ## 1/s: speed per meter of visible terrain above (or below) the margin
+var gen_blocked := false ## The first missing region ahead is one the generator has to make this step
+var gen_target := INF ## The generation law's speed this step (INF when not blocked or nothing measured)
+var gen_blocked_time := 0.0 ## Total time the front was held by the generator
+var gen_rate_est := 0.0 ## The generator's throughput along the path (m/s), valid once gen_rate_valid
+var gen_rate_valid := false
+var gen_rate_hold := 0.0
+var gen_samples := 0
+var _gen_at := INF
+var _gen_loc = null
+var _gen_win_t := 0.0
+var _gen_win_sat := 0.0
+var _gen_win_n := -1
+
 var start_altitude := 0.0
 var cruise_altitude := 0.0
 var end_altitude := 0.0
@@ -203,7 +238,7 @@ func observe_loader(delta: float, disk_loads_total: int, saturated: bool, metres
 	if _win_loads < 0:
 		_win_loads = disk_loads_total
 	_win_t += delta
-	_win_sat += delta if saturated and not gate_blocked else 0.0 # A front held by the gate says nothing about the loader
+	_win_sat += delta if saturated and not gate_blocked and not gen_blocked else 0.0 # A front held by the gate or the generator says nothing about the loader
 	if _win_t < rate_window:
 		return
 	var r := float(disk_loads_total - _win_loads) / _win_t * metres_per_load
@@ -226,6 +261,34 @@ func observe_loader(delta: float, disk_loads_total: int, saturated: bool, metres
 func observe_gate(held_at: float, location = null) -> void:
 	_gate_at = held_at
 	_gate_loc = location
+
+
+## Feed the generator (lazily generated regions): finished_total is the running count of regions the generator finished (the ones the game
+## notified), wanted_pending the streamer's generating_wanted stat (0 = nothing wanted is left to generate), metres_per_region the path
+## length one finished region advances the front (region size / regions per column of the corridor, pending ones included: get_path_cost()
+## regions + generating), held_at the distance along the path (the axis of `distance`) where the nearest wanted pending region the
+## corridor needs enters the corridor (INF if none) and location that region (given to generation_eta). Call every physics frame before
+## step(), only when regions are generated lazily.
+func observe_generation(delta: float, finished_total: int, wanted_pending: int, metres_per_region: float, held_at: float = INF, location = null) -> void:
+	_gen_at = held_at if wanted_pending > 0 else INF
+	_gen_loc = location
+	if _gen_win_n < 0:
+		_gen_win_n = finished_total
+	_gen_win_t += delta
+	_gen_win_sat += delta if wanted_pending >= gen_queue_min else 0.0
+	if _gen_win_t < rate_window:
+		return
+	var r := float(finished_total - _gen_win_n) / _gen_win_t * metres_per_region
+	var a := 1.0 - exp(-_gen_win_t / (rate_tau if r > gen_rate_est else rate_tau_down))
+	if _gen_win_sat >= 0.9 * _gen_win_t:
+		gen_rate_est = r if not gen_rate_valid else lerpf(gen_rate_est, r, a) # The queue was full: what the generator can do
+		gen_rate_valid = true
+		gen_samples += 1
+	elif gen_rate_valid and r > gen_rate_est:
+		gen_rate_est = lerpf(gen_rate_est, r, a) # It kept up with less work waiting: it can do at least this
+	_gen_win_t = 0.0
+	_gen_win_sat = 0.0
+	_gen_win_n = finished_total
 
 
 ## Landed: the footprint goes back to full
@@ -293,6 +356,18 @@ func setup(path_length: float, heights: PackedFloat32Array, sample_step: float, 
 	gate_blocked_time = 0.0
 	_gate_at = INF
 	_gate_loc = null
+	gen_blocked = false
+	gen_target = INF
+	gen_blocked_time = 0.0
+	gen_rate_est = 0.0
+	gen_rate_valid = false
+	gen_rate_hold = 0.0
+	gen_samples = 0
+	_gen_at = INF
+	_gen_loc = null
+	_gen_win_t = 0.0
+	_gen_win_sat = 0.0
+	_gen_win_n = -1
 	safety_full = -1.0
 	distance = 0.0
 	speed = 0.0
@@ -418,6 +493,23 @@ func _gate_law() -> float:
 	return minf(v, max_speed)
 
 
+## The speed that tracks the generator: its measured throughput along the path (the front advances that fast) and a term that pulls the
+## visible terrain towards the margin, so the speed settles where it equals the generator's rate. INF while no throughput was measured
+## (the generator never had a queue: nothing but the braking distance clamp limits the camera), and the arrive-at-the-edge speed for a
+## front that generation_eta says is far away.
+func _gen_law() -> float:
+	var margin := safety + stop_distance(speed, max_accel * brake_fraction, max_jerk) + speed * margin_look
+	var v := INF
+	if gen_rate_valid:
+		var rate := gen_rate_hold if gen_rate_hold > 0.0 else gen_rate_est
+		v = rate * gen_fraction + gen_k * (ready_soft - margin)
+	if generation_eta.is_valid() and _gen_loc != null:
+		var e: Variant = generation_eta.call(_gen_loc)
+		if (typeof(e) == TYPE_FLOAT or typeof(e) == TYPE_INT) and float(e) > gate_eta_long:
+			v = minf(v, maxf(ready_filtered - margin, 0.0) / float(e)) # Arrive at the edge when the region appears
+	return minf(v, max_speed)
+
+
 func step(delta: float, ready_distance: float = INF) -> void:
 	var dt := maxf(delta, 1e-4)
 	elapsed += dt
@@ -450,23 +542,35 @@ func step(delta: float, ready_distance: float = INF) -> void:
 		gate_blocked_time += dt
 		if soft:
 			gate_target = _gate_law()
+	# The generator: is the first missing region ahead one that still has to be generated (and not one held by a gate or still loading)?
+	gen_blocked = gen_aware and limited and not gate_blocked and _gen_at < INF and _gen_at <= distance + ready_distance + gate_tol
+	gen_target = INF
+	if gen_blocked:
+		gen_blocked_time += dt
+		if soft:
+			gen_target = _gen_law()
+	if gen_rate_valid:
+		gen_rate_hold = gen_rate_est if gen_rate_hold <= 0.0 else lerpf(gen_rate_hold, gen_rate_est, 1.0 - exp(-dt / rate_hold_tau))
+	var held := gate_blocked or gen_blocked
 	var a_prev := accel
 	var v_hard := target_speed()
-	var v_soft := gate_target if gate_blocked and soft else soft_target()
+	var v_soft := gate_target if gate_blocked and soft else (gen_target if gen_blocked and soft else soft_target())
 	soft_speed = v_soft
 	var v_target := minf(v_hard, v_soft)
 	adapting = soft and v_soft < v_hard and v_soft < max_speed * 0.995
 	var ready_brake := INF if is_inf(ready_filtered) else speed_for_distance(ready_filtered - safety, max_accel * brake_fraction, max_jerk)
-	# A front held by the gate is not the loader: no quality loss, no limit_seen
-	var loader_limited := soft and rate_valid and not gate_blocked and minf(v_soft, ready_brake) < max_speed * 0.97
+	# A front held by the gate or the generator is not the loader: no quality loss, no limit_seen
+	var loader_limited := soft and rate_valid and not held and minf(v_soft, ready_brake) < max_speed * 0.97
 	limit_seen = limit_seen or loader_limited
 	if rate_valid:
 		rate_hold = rate_est if rate_hold <= 0.0 else lerpf(rate_hold, rate_est, 1.0 - exp(-dt / rate_hold_tau))
-	if soft and rate_valid and limited and not gate_blocked and _unsat_time >= 0.5:
+	if soft and rate_valid and limited and not held and _unsat_time >= 0.5:
 		# The queue is not full although regions are missing: the loader is not the limit, probe upwards slowly
 		rate_est = minf(rate_est * (1.0 + 0.25 * dt), max_speed / cruise_fraction)
+	# Only a generator that cannot keep up with the cruise shrinks the footprint (a smaller corridor needs fewer regions per meter of path)
+	var gen_limited := soft and gen_blocked and gen_rate_valid and gen_target < gen_degrade_fraction * max_speed
 	if soft:
-		if loader_limited:
+		if loader_limited or gen_limited:
 			quality = maxf(quality - quality_rate * dt, quality_min) # Shrink the sharp footprint before slowing further
 	if adapting:
 		# Smooth loader limited speed: a fraction of the normal deceleration and jerk, no braking curve

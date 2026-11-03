@@ -155,21 +155,23 @@ func _fly_gen(g: FlightGovernor, length: float, gen_rate: float, mpl: float, loo
 		var eta_fn := func(_loc: Vector2i) -> float: return 1.0 / maxf(gen_rate, 0.001) # The front region is next in the queue
 		g.generation_eta = eta_fn
 	while steps < 60 * 150:
-		var wanted := maxi(int((g.distance + lookahead - front[0]) / mpl), 0) if front[0] < length else 0
+		# A smaller footprint (the quality) means a narrower corridor: fewer regions per meter of path, the front advances further per region
+		var mpl_q := mpl / (0.5 + 0.5 * g.quality)
+		var wanted := maxi(int((g.distance + lookahead - front[0]) / mpl_q), 0) if front[0] < length else 0
 		if wanted > 0:
 			acc += gen_rate * DT
 			while acc >= 1.0 and front[0] < length and front[0] < g.distance + lookahead:
 				acc -= 1.0
-				front[0] += mpl
+				front[0] += mpl_q
 				finished[0] += 1
-			wanted = maxi(int((g.distance + lookahead - front[0]) / mpl), 0) if front[0] < length else 0
+			wanted = maxi(int((g.distance + lookahead - front[0]) / mpl_q), 0) if front[0] < length else 0
 		var ready := minf(front[0] - g.distance, length - g.distance) if front[0] < length else INF
 		r.queue_max = maxi(r.queue_max, wanted)
 		if mode == "gen":
-			g.observe_generation(DT, finished[0], wanted, mpl, front[0] if wanted > 0 else INF, Vector2i(finished[0], 0))
+			g.observe_generation(DT, finished[0], wanted, mpl_q, front[0] if wanted > 0 else INF, Vector2i(finished[0], 0))
 		elif mode == "gate":
 			g.observe_gate(front[0] if wanted > 0 else INF, Vector2i(finished[0], 0))
-		g.observe_loader(DT, int(t * 30.0), true, mpl)
+		g.observe_loader(DT, int(t * 30.0), wanted > 0, mpl_q) # Busy while regions are waiting for the generator: all the loader has to do is keep up
 		g.step(DT, ready)
 		t += DT
 		steps += 1
@@ -193,6 +195,7 @@ func _fly_gen(g: FlightGovernor, length: float, gen_rate: float, mpl: float, loo
 			r.time = t
 			break
 	r.margin = g.min_ready_margin
+	r["q_end"] = g.quality
 	return r
 
 
@@ -550,6 +553,93 @@ func _initialize() -> void:
 	g.gate_aware = false
 	g.step(DT, 3000.0)
 	ok(not g.gate_blocked, "gate: gate_aware = false turns it off")
+
+	# 10. Lazily generated regions. A generator makes `rate` regions a second in the order of the path (34 m of path each, the 256 m regions of
+	# a 7.5 region wide corridor), 5 km of lookahead, the loader reads busy. The generation law follows its throughput; the gate law (made for
+	# releases that come together) and a governor that reads the lag as a slow loader are the comparison.
+	var mpl_gen := 34.0
+	var gen_res := {}
+	for gen_regions_per_s: float in [100.0, 45.0, 30.0]: # 3.4 km/s (faster than the camera), 1.5 km/s, 1.0 km/s
+		for mode: String in ["gen", "gate", "none"]:
+			g = FlightGovernor.new()
+			g.gate_aware = mode == "gate"
+			var rg := _fly_gen(g, 10000.0, gen_regions_per_s, mpl_gen, 2700.0 if gen_regions_per_s > 60.0 else 5000.0, mode)
+			rg["rate_est"] = g.gen_rate_est
+			rg["clamp"] = g.clamp_hits
+			rg["samples"] = g.gen_samples
+			gen_res["%d %s" % [int(gen_regions_per_s), mode]] = rg
+			print("generator %3.0f regions/s (%4.0f m/s) %-4s: arrive %.2f s, landed %.2f, quality min %.2f, rest %.2f s, slowest mid %.0f m/s, blocked %.1f s, rate est %.0f (%d samples), clamp hits %d, margin %.0f" % [
+					gen_regions_per_s, gen_regions_per_s * mpl_gen, mode, rg.arrive, rg.time, rg.qmin, rg.rest_t, rg.v_min_mid, rg.blocked_t, g.gen_rate_est, g.gen_samples, g.clamp_hits, rg.margin])
+	var unobstructed: Dictionary = _fly_gen(FlightGovernor.new(), 10000.0, 1.0e6, mpl_gen, 2700.0, "none")
+	for gen_regions_per_s: float in [100.0, 45.0, 30.0]:
+		var key := "%d " % int(gen_regions_per_s)
+		var gg: Dictionary = gen_res[key + "gen"]
+		var gt: Dictionary = gen_res[key + "gate"]
+		var gn: Dictionary = gen_res[key + "none"]
+		var true_rate := gen_regions_per_s * mpl_gen
+		ok(gg.time > 0.0, "generation %.0f m/s: lands (%.2f s)" % [true_rate, gg.time])
+		if true_rate > 3000.0:
+			ok(gg.qmin == 1.0, "generation %.0f m/s: a generator that keeps up with the cruise costs no footprint quality (%.2f; unaware %.2f)" % [true_rate, gg.qmin, gn.qmin])
+		else:
+			ok(gg.qmin < 1.0, "generation %.0f m/s: a generator slower than the cruise shrinks the footprint (%.2f), which makes the front advance further per region" % [true_rate, gg.qmin])
+		ok(gg.clamp == 0 and gg.margin >= -0.5, "generation %.0f m/s: the failsafe clamp never engaged, the generator's front is never closer than the safety distance (margin %.0f)" % [true_rate, gg.margin])
+		ok(gg.arrive <= gt.arrive + 0.3, "generation %.0f m/s: the generation law (%.2f s) is not later than the gate law (%.2f s)" % [true_rate, gg.arrive, gt.arrive])
+		ok(gg.peak_a <= 4000.0 * 1.001 and gg.peak_j <= 12000.0 * 1.001, "generation %.0f m/s: acceleration and jerk within the limits (%.0f, %.0f)" % [true_rate, gg.peak_a, gg.peak_j])
+		ok(gg.blocked_t > 0.5 or true_rate > 3000.0, "generation %.0f m/s: the front is recognised as the generator's (%.1f s)" % [true_rate, gg.blocked_t])
+	var g100: Dictionary = gen_res["100 gen"]
+	ok(g100.arrive <= unobstructed.arrive + 0.5, "generation: a generator faster than the camera costs nothing (%.2f s against %.2f s unobstructed)" % [g100.arrive, unobstructed.arrive])
+	ok(g100.blocked_t < 1.0 and g100.qmin == 1.0, "generation: and the camera is hardly ever held by it (%.1f s)" % g100.blocked_t)
+	for gen_regions_per_s: float in [45.0, 30.0]:
+		var gs: Dictionary = gen_res["%d gen" % int(gen_regions_per_s)]
+		var true_rate := gen_regions_per_s * mpl_gen
+		var front_end := (10000.0 - 3000.0) / true_rate # When the generator has made the last region
+		var eff_rate: float = true_rate / (0.5 + 0.5 * gs.q_end) # The corridor got narrower: each region advances the front further
+		ok(absf(gs.rate_est - eff_rate) <= 0.2 * eff_rate, "generation %.0f m/s: the rate estimate %.0f is within 20%% of the true rate along the path %.0f" % [true_rate, gs.rate_est, eff_rate])
+		ok(gs.arrive <= front_end + 3.0 and gs.rest_t < 0.3, "generation %.0f m/s: the camera follows the generator, arrival %.2f s is %.1f s after its last region, rests %.2f s" % [true_rate, gs.arrive, gs.arrive - front_end, gs.rest_t])
+		ok(gen_res["%d none" % int(gen_regions_per_s)].qmin < 1.0, "generation %.0f m/s: a governor unaware of the generator reads the lag as a slow loader (quality %.2f), the defect" % [true_rate, gen_res["%d none" % int(gen_regions_per_s)].qmin])
+	# With an eta of 2.5 s per region the camera arrives at the edge of the terrain when the next region appears
+	g = FlightGovernor.new()
+	var ge1 := _fly_gen(g, 10000.0, 0.4, 2000.0, 6000.0, "gen", false)
+	g = FlightGovernor.new()
+	var ge2 := _fly_gen(g, 10000.0, 0.4, 2000.0, 6000.0, "gen", true)
+	print("generator 0.4 regions/s of 2 km: arrive %.2f s (eta %.2f s), slowest mid %.0f (eta %.0f), rest %.2f (eta %.2f), margin %.0f (eta %.0f)" % [ge1.arrive, ge2.arrive, ge1.v_min_mid, ge2.v_min_mid, ge1.rest_t, ge2.rest_t, ge1.margin, ge2.margin])
+	ok(ge1.time > 0.0 and ge2.time > 0.0 and ge1.margin >= -0.5 and ge2.margin >= -0.5, "generation eta: lands and never within the safety distance of the front (margin %.0f, with eta %.0f)" % [ge1.margin, ge2.margin])
+	ok(ge2.arrive <= ge1.arrive + 1.0 and ge2.rest_t <= ge1.rest_t + 0.1 and ge2.v_min_mid >= ge1.v_min_mid, "generation eta: arrival %.2f s with the eta is within 1 s of %.2f s without it, resting no longer (%.2f s, %.2f s) and never as slow (%.0f, %.0f m/s)" % [ge2.arrive, ge1.arrive, ge2.rest_t, ge1.rest_t, ge2.v_min_mid, ge1.v_min_mid])
+	# What counts as the generator's front, and the throughput samples
+	g = FlightGovernor.new()
+	g.setup(10000.0, _heights(10000.0, 50.0, 40.0), 50.0, 0.0, 0.0)
+	g.observe_generation(DT, 0, 40, 34.0, 8000.0, Vector2i(31, 0)) # A pending region 8 km along, the front is at 3 km
+	g.step(DT, 3000.0)
+	ok(not g.gen_blocked, "generation: a pending region far beyond the first missing region does not make the front the generator's")
+	g.observe_generation(DT, 0, 40, 34.0, 3100.0, Vector2i(12, 0))
+	g.step(DT, 3000.0)
+	ok(g.gen_blocked and not g.gate_blocked, "generation: a pending region at the front does")
+	g.observe_generation(DT, 0, 0, 34.0, 3100.0, Vector2i(12, 0)) # Nothing wanted is left to generate
+	g.step(DT, 3000.0)
+	ok(not g.gen_blocked, "generation: nothing wanted left to generate (generating_wanted 0) is not a generator front")
+	g.gen_aware = false
+	g.observe_generation(DT, 0, 40, 34.0, 3100.0, Vector2i(12, 0))
+	g.step(DT, 3000.0)
+	ok(not g.gen_blocked, "generation: gen_aware = false turns it off")
+	g = FlightGovernor.new()
+	g.setup(10000.0, _heights(10000.0, 50.0, 40.0), 50.0, 0.0, 0.0)
+	var fin := 0
+	for i in 120: # A generator that never has a queue: its rate is a floor, not a measurement
+		fin += 1
+		g.observe_generation(DT, fin, 2, 34.0, 3100.0, Vector2i(fin, 0))
+	ok(not g.gen_rate_valid, "generation: with fewer than gen_queue_min regions waiting no throughput is taken as the generator's limit")
+	g.gen_queue_min = 2
+	for i in 120:
+		fin += 1
+		g.observe_generation(DT, fin, 2, 34.0, 3100.0, Vector2i(fin, 0))
+	ok(g.gen_rate_valid and absf(g.gen_rate_est - 60.0 * 34.0) < 0.1 * 60.0 * 34.0, "generation: and with the queue full it is measured (%.0f m/s of %.0f)" % [g.gen_rate_est, 60.0 * 34.0])
+	# A region the gate holds is the gate's: the generator does not claim it
+	g = FlightGovernor.new()
+	g.setup(10000.0, _heights(10000.0, 50.0, 40.0), 50.0, 0.0, 0.0)
+	g.observe_gate(3100.0, Vector2i(12, 0))
+	g.observe_generation(DT, 0, 40, 34.0, 3100.0, Vector2i(12, 0))
+	g.step(DT, 3000.0)
+	ok(g.gate_blocked and not g.gen_blocked, "generation: a front both feeds claim is the gate's")
 
 	print("SUITE ", "GREEN" if _fail == 0 else "RED (%d failures)" % _fail)
 	quit(0 if _fail == 0 else 1)
