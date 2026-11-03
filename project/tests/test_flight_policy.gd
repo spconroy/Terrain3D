@@ -84,7 +84,7 @@ func _world(rs: int) -> Dictionary:
 	var master := _root_dir + "/master_%d.res" % rs
 	_write_region(master, rs)
 	var rows := 3 if rs == 512 else 5
-	var x1 := int(28000.0 / rs) + 8
+	var x1 := int(30000.0 / rs) + 8
 	var known := {}
 	for y in range(-rows, rows + 1):
 		for x in range(-4, x1 + 1):
@@ -178,7 +178,18 @@ func _run() -> void:
 	var small_slots := {512: 90, 256: 200}
 	var big_slots := {512: 160, 256: 400}
 	var plan: Array = []
-	for rs: int in sizes:
+	# sweep=5000,10000,... : only flights of these lengths (pre-generated corridor, default loaders), to fit the governor's overhead
+	var sweep: Array = []
+	if _args.has("sweep"):
+		for d in String(_args["sweep"]).split(","):
+			sweep.append(float(d))
+		for rs: int in sizes:
+			var sb := _base_cfg()
+			sb.rs = rs
+			sb.slots = big_slots[rs]
+			for d: float in sweep:
+				plan.append(_cfg(sb, "%d m %d km sweep, prefetch" % [rs, int(d / 1000.0)], {"length": d}))
+	for rs: int in sizes if sweep.is_empty() else []:
 		var b := _base_cfg()
 		b.rs = rs
 		b.slots = big_slots[rs]
@@ -216,7 +227,7 @@ func _run() -> void:
 		plan.append(_cfg(b, "%d m 10 km v2 soft, one upload step per frame at 40 Hz, no ring" % rs, {"conc": 1, "budget": 0.05, "prefetch": false, "timeout": 400.0, "hz": 40, "ring": false, "expect_zero": false}))
 	# The insert gate: a fake tree streamer holds 1 km tiles until 2..4 s after the streamer first asks about them. The governor must
 	# slow for the visible edge without reading the held regions as a slow loader. Loaders as the demo clips (conc 8, 4 per frame, 4 ms)
-	for rs: int in sizes:
+	for rs: int in sizes if sweep.is_empty() else []:
 		var gb := _base_cfg()
 		gb.rs = rs
 		gb.slots = big_slots[rs]
@@ -230,7 +241,7 @@ func _run() -> void:
 		plan.append(_cfg(gb, "%d m 10 km gate scenario - wait forever, exact eta" % rs, {"gate": {"min": 2.0, "max": 4.0, "eta": true}, "csv": true}))
 		plan.append(_cfg(gb, "%d m 10 km gate scenario - wait forever, v1 clamp" % rs, {"gate": gate_wait, "soft": false}))
 	# Frame pacing: dynamic collision refresh and the frame budget
-	for rs: int in sizes:
+	for rs: int in sizes if sweep.is_empty() else []:
 		var cb := _base_cfg()
 		cb.rs = rs
 		cb.slots = big_slots[rs]
@@ -252,11 +263,13 @@ func _run() -> void:
 		var r: Dictionary = await _fly(cfg)
 		_rows.append(r.row)
 		print("ROW ", r.row)
+		if not sweep.is_empty():
+			print("SWEEP rs %d length %.0f cruise %.0f arrive %.3f landed %.3f hover %.3f overhead %.3f quality %.2f" % [cfg.rs, cfg.length, r.m.cap, r.m.arrive, r.m.complete, r.m.hover, r.m.arrive - cfg.length / r.m.cap, r.m.quality_min])
 	# Prefetch timing and the cost of the corridor
 	var costs: Array[String] = []
 	for rs: int in sizes:
 		for length: float in [10000.0, 28000.0]:
-			if only != "" and only != "prefetch":
+			if (only != "" and only != "prefetch") or not sweep.is_empty():
 				continue
 			costs.append(await _prefetch_time(rs, length))
 	print("")
@@ -844,6 +857,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	for e: float in gm.episodes:
 		longest = maxf(longest, e)
 	m["hover"] = gm.first_move
+	m["cap"] = g.max_speed
 	m["rest_t"] = gm.rest_t
 	m["rest_longest"] = longest
 	m["rests"] = gm.episodes.size()
@@ -871,6 +885,11 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		ok(m.wanted_missing == 0 and m.ring_missing == 0, "%s: every wanted region and the whole destination ring are resident on arrival (%d, %d missing)" % [label, m.wanted_missing, m.ring_missing])
 		ok(m.peak_v <= g.max_speed * 1.001 and m.peak_a <= g.max_accel * 1.001 and m.peak_j <= g.max_jerk * 1.001, "%s: speed, acceleration and jerk within the limits (%.0f m/s, %.0f, %.0f)" % [label, m.peak_v, m.peak_a, m.peak_j])
 		ok(m.da_ratio <= 1.01, "%s: acceleration continuous, largest step %.3f of the jerk limit" % [label, m.da_ratio])
+		if cfg.cap < 0.0 and label.find("km governed, ") >= 0 and length >= 10000.0 and cfg.lookahead:
+			# The default loaders, pre-generated corridor: the flight takes about its time budget (the overhead is measured, see cruise_for_distance)
+			var t_budget := g.budget_for_distance(length)
+			ok(m.arrive <= t_budget + 0.6, "%s: arrives in %.2f s, within 0.6 s of the %.1f s budget" % [label, m.arrive, t_budget])
+			ok(m.arrive >= t_budget - 1.5, "%s: and not much earlier than the budget (%.2f s of %.1f s)" % [label, m.arrive, t_budget])
 		ok(g.clamp_hits == 0, "%s: the braking constraint alone held, the failsafe clamp never engaged (%d)" % [label, g.clamp_hits])
 		ok(m.behind_age_max <= 45 and far_left == 0, "%s: regions more than a tile behind unload within %d frames (and %d are left at the end)" % [label, m.behind_age_max, far_left])
 		ok(m.late_inserts == 0 and m.lead_t_min >= 0.0, "%s: no column of the route is inserted once the camera is within a tile of it (lead min %.2f s, %.0f m ahead)" % [label, m.lead_t_min, m.lead_dist_min])

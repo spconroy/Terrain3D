@@ -39,15 +39,25 @@ extends RefCounted
 ## terrain.collision_mode = Terrain3DCollision.DISABLED at take-off and restore it at landing; set it after
 ## add_child (before it the mode is ignored).
 
-## Upper clamp on the speed (m/s), not a target. Short hops never reach it. With auto_cap, setup() sets it from the
-## flight distance: cap_low up to cap_d_low, rising linearly to cap_high at cap_d_high (2.5 km/s up to 12 km, 3.5 km/s
-## at 28 km), so a 10 km flight keeps its ~5 s and a 28 km flight is not twice as long. Scale the blur to speed / max_speed.
+## Upper clamp on the speed (m/s), not a target. Short hops never reach it. With auto_cap, setup() sets it to the nominal cruise of the
+## flight, cruise_for_distance(length): a flight TIME budget, not a faster cap for long flights. Scale the blur to speed / max_speed.
 var max_speed := 2500.0
 var auto_cap := true
-var cap_low := 2500.0
-var cap_high := 3500.0
-var cap_d_low := 12000.0
-var cap_d_high := 28000.0
+## Flight time budget. A flight of budget_d_low meters should take about budget_t_low seconds (about 6: the hard cap's 4 s plus the
+## 1.9 s overhead) and one of budget_d_high meters about budget_t_high seconds, linear in between and beyond ("if we need 15 seconds for the 28 km flight, give ourselves 15 seconds").
+## The cruise that meets it is distance / (budget - overhead), at most hard_cap (up to budget_d_low the cruise is the hard cap and the
+## arrival is what the take-off and landing make it: short hops stay the smooth triangle profile). The overhead is what a flight
+## takes on top of distance / cruise: the hover until the first terrain is ready, the jerk limited ramps and the landing. It is
+## MEASURED (headless, pre-generated corridor, default loaders, 256 m regions, see cruise_for_distance), linear in the distance:
+## overhead_low s at budget_d_low and overhead_high s at budget_d_high. A slower loader or a generator that trickles makes the flight
+## later than its budget (the governor slows the camera to what is loaded); it never makes it faster.
+var hard_cap := 2500.0
+var budget_d_low := 10000.0
+var budget_t_low := 5.9
+var budget_d_high := 28000.0
+var budget_t_high := 15.0
+var overhead_low := 1.9
+var overhead_high := 2.7
 var max_accel := 4000.0 ## m/s^2
 var max_jerk := 12000.0 ## m/s^3
 ## Share of max_accel the governor plans a stop inside the loaded terrain with, the rest is reserve.
@@ -161,9 +171,21 @@ var _pitch_vel := 0.0
 var _fov_vel := 0.0
 
 
-## The speed cap for a flight of this distance
-func cap_for_distance(d: float) -> float:
-	return lerpf(cap_low, cap_high, clampf((d - cap_d_low) / maxf(cap_d_high - cap_d_low, 1.0), 0.0, 1.0))
+## The flight time (s) a flight of this distance is budgeted: linear in the distance, extended past budget_d_high.
+func budget_for_distance(d: float) -> float:
+	return lerpf(budget_t_low, budget_t_high, (d - budget_d_low) / maxf(budget_d_high - budget_d_low, 1.0))
+
+
+## What a flight of this distance takes on top of distance / cruise (the measured overhead, linear in the distance).
+func overhead_for_distance(d: float) -> float:
+	return maxf(lerpf(overhead_low, overhead_high, (d - budget_d_low) / maxf(budget_d_high - budget_d_low, 1.0)), 0.0)
+
+
+## The nominal cruise speed (and the speed cap) for a flight of this distance: distance / (time budget - overhead), at most hard_cap.
+func cruise_for_distance(d: float) -> float:
+	if d <= budget_d_low:
+		return hard_cap # Short hops: the cap is an upper clamp, they never reach it and fly the triangle profile
+	return minf(hard_cap, d / maxf(budget_for_distance(d) - overhead_for_distance(d), 0.5))
 
 
 ## Blur strength and similar effects scale to this (0..1 of the cap for this flight)
@@ -252,7 +274,7 @@ static func track(v: float, a: float, v_target: float, a_max: float, j_max: floa
 func setup(path_length: float, heights: PackedFloat32Array, sample_step: float, ground_start: float, ground_end: float) -> void:
 	length = path_length
 	if auto_cap:
-		max_speed = cap_for_distance(path_length)
+		max_speed = cruise_for_distance(path_length)
 	rate_est = 0.0
 	rate_hold = 0.0
 	rate_valid = false

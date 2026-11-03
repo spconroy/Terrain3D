@@ -137,6 +137,65 @@ func _fly_gate(g: FlightGovernor, length: float, tile: float, release_fn: Callab
 	return r
 
 
+## Flies over a corridor of lazily generated regions with a fake stats provider. The generator makes gen_rate regions a second, in the order of
+## the path, and only regions inside the lookahead (the wanted ones); each region advances the visible front by mpl meters. The loader is
+## busy the whole time (saturated), what an unaware governor reads as a slow loader. mode: "gen" feeds observe_generation, "gate" feeds
+## observe_gate (the held regions released as a trickle), "none" feeds nothing.
+func _fly_gen(g: FlightGovernor, length: float, gen_rate: float, mpl: float, lookahead: float, mode: String, use_eta: bool = false, front0: float = 3000.0) -> Dictionary:
+	var h := _heights(length, 50.0, 40.0)
+	g.setup(length, h, 50.0, h[0], h[h.size() - 1])
+	var front := [front0]
+	var finished := [0]
+	var acc := 0.0
+	var t := 0.0
+	var steps := 0
+	var r := {"arrive": -1.0, "time": -1.0, "qmin": 1.0, "rest_t": 0.0, "first_move": -1.0, "v_min_mid": INF, "peak_v": 0.0, "peak_a": 0.0, "peak_j": 0.0,
+			"margin": INF, "blocked_t": 0.0, "v": [], "queue_max": 0}
+	if use_eta:
+		var eta_fn := func(_loc: Vector2i) -> float: return 1.0 / maxf(gen_rate, 0.001) # The front region is next in the queue
+		g.generation_eta = eta_fn
+	while steps < 60 * 150:
+		var wanted := maxi(int((g.distance + lookahead - front[0]) / mpl), 0) if front[0] < length else 0
+		if wanted > 0:
+			acc += gen_rate * DT
+			while acc >= 1.0 and front[0] < length and front[0] < g.distance + lookahead:
+				acc -= 1.0
+				front[0] += mpl
+				finished[0] += 1
+			wanted = maxi(int((g.distance + lookahead - front[0]) / mpl), 0) if front[0] < length else 0
+		var ready := minf(front[0] - g.distance, length - g.distance) if front[0] < length else INF
+		r.queue_max = maxi(r.queue_max, wanted)
+		if mode == "gen":
+			g.observe_generation(DT, finished[0], wanted, mpl, front[0] if wanted > 0 else INF, Vector2i(finished[0], 0))
+		elif mode == "gate":
+			g.observe_gate(front[0] if wanted > 0 else INF, Vector2i(finished[0], 0))
+		g.observe_loader(DT, int(t * 30.0), true, mpl)
+		g.step(DT, ready)
+		t += DT
+		steps += 1
+		r.qmin = minf(r.qmin, g.quality)
+		r.peak_v = maxf(r.peak_v, g.speed)
+		r.peak_a = maxf(r.peak_a, absf(g.accel))
+		r.peak_j = maxf(r.peak_j, absf(g.jerk))
+		if g.distance > 1.0 and r.first_move < 0.0:
+			r.first_move = t
+		if r.first_move >= 0.0 and g.distance < length - 0.5:
+			if g.speed < 5.0:
+				r.rest_t += DT
+			if g.distance > 0.15 * length and g.distance < 0.85 * length:
+				r.v_min_mid = minf(r.v_min_mid, g.speed)
+		if g.gen_blocked or g.gate_blocked:
+			r.blocked_t += DT
+		if g.distance >= length - 0.5 and r.arrive < 0.0:
+			r.arrive = t
+		r.v.append(g.speed)
+		if g.is_done():
+			r.time = t
+			break
+	r.margin = g.min_ready_margin
+	return r
+
+
 ## Cruise at the cap plus half of the S-curve ramp up and half of the ramp down
 func _theory(g: FlightGovernor, length: float) -> float:
 	var a_end := g.max_accel * g.end_brake_fraction
@@ -146,7 +205,25 @@ func _theory(g: FlightGovernor, length: float) -> float:
 func _initialize() -> void:
 	var cap := 2500.0
 	var gc := FlightGovernor.new()
-	ok(gc.cap_for_distance(10000.0) == 2500.0 and gc.cap_for_distance(12000.0) == 2500.0 and absf(gc.cap_for_distance(20000.0) - 3000.0) < 1.0 and gc.cap_for_distance(28000.0) == 3500.0 and gc.cap_for_distance(40000.0) == 3500.0, "cap by distance: 2.5 km/s to 12 km, 3.0 at 20 km, 3.5 at 28 km and beyond")
+	# The cruise follows the flight time budget with the measured overhead: distance / (budget - overhead), at most the hard cap
+	ok(gc.cruise_for_distance(300.0) == 2500.0 and gc.cruise_for_distance(5000.0) == 2500.0 and absf(gc.cruise_for_distance(10000.0) - 2500.0) < 0.01, "cruise by distance: the 2.5 km/s hard cap up to 10 km (short hops stay triangles)")
+	var c10 := gc.cruise_for_distance(10000.0)
+	var c28 := gc.cruise_for_distance(28000.0)
+	var c40 := gc.cruise_for_distance(40000.0)
+	print("cruise: 10 km %.0f, 15 km %.0f, 20 km %.0f, 28 km %.0f, 40 km %.0f m/s" % [c10, gc.cruise_for_distance(15000.0), gc.cruise_for_distance(20000.0), c28, c40])
+	ok(absf(28000.0 / c28 + gc.overhead_high - gc.budget_t_high) < 0.01 and c28 < c10 and c28 > 2200.0, "cruise by distance: 28 km flies at %.0f m/s so that distance / cruise + overhead (%.1f s) is the 15 s budget, below the 10 km cruise (the 3.5 km/s cap is gone)" % [c28, gc.overhead_high])
+	var mono := true
+	var prev_c := INF
+	for d in range(10000, 60001, 1000):
+		var cd := gc.cruise_for_distance(float(d))
+		mono = mono and cd <= gc.hard_cap and cd > 1500.0 and cd <= prev_c + 1.0
+		prev_c = cd
+	ok(mono, "cruise by distance: never above the hard cap, never rising with the distance (the budget grows faster than the overhead), no collapse to 60 km (%.0f at 40 km)" % c40)
+	ok(absf(gc.cruise_for_distance(28000.0) * (gc.budget_t_high - gc.overhead_high) - 28000.0) < 1.0, "cruise by distance: budget parameters are configurable")
+	var gb := FlightGovernor.new()
+	gb.budget_t_high = 20.0
+	gb.hard_cap = 2000.0
+	ok(gb.cruise_for_distance(28000.0) < c28 and gb.cruise_for_distance(5000.0) == 2000.0 and gb.cruise_for_distance(28000.0) <= 2000.0, "cruise by distance: a longer budget or a lower hard cap lowers the cruise (%.0f)" % gb.cruise_for_distance(28000.0))
 
 	# Stop distance helpers invert each other
 	var inv_ok := true
@@ -171,8 +248,10 @@ func _initialize() -> void:
 	g = FlightGovernor.new()
 	var r28 := _fly(g, 28000.0, 40.0, func(_s: float, _t: float) -> float: return INF)
 	var theory28 := _theory(g, 28000.0)
-	print("28 km: cap %.0f, arrive %.2f s (theory %.2f, at the 2.5 km/s cap it would be %.2f)" % [g.max_speed, r28.arrive, theory28, 28000.0 / 2500.0 + 1.5])
-	ok(g.max_speed == 3500.0, "28 km: the cap rose to 3.5 km/s")
+	print("28 km: cruise %.0f, arrive %.2f s (theory %.2f, budget %.1f s)" % [g.max_speed, r28.arrive, theory28, g.budget_t_high])
+	ok(absf(g.max_speed - c28) < 0.5 and g.max_speed < 2500.0, "28 km: setup() takes the cruise from the time budget (%.0f m/s)" % g.max_speed)
+	# The governor alone has no take-off hover (the flights in test_flight_policy wait about 0.8 s for the first terrain) and no loader
+	ok(r28.arrive < g.budget_t_high and r28.arrive > g.budget_t_high - 2.5, "28 km: unobstructed, the flight takes less than the budget of %.1f s and no more than the overhead less (%.2f s)" % [g.budget_t_high, r28.arrive])
 	ok(r28.arrive > 0.0 and absf(r28.arrive - theory28) < 0.06 * theory28 and r28.peak_v <= g.max_speed * 1.001, "28 km: arrival after %.2f s (theory %.2f), peak %.0f" % [r28.arrive, theory28, r28.peak_v])
 
 	# 3. Short hops: the cap is an upper clamp only, the trapezoid becomes a smooth triangle
