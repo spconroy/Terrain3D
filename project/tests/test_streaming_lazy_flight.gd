@@ -6,9 +6,8 @@ extends SceneTree
 ## counts pending locations as missing), the governor must not read generation lag as a slow loader (observe_gate, with
 ## generating_wanted as the trigger and a generation ETA), no hole may ever show, the destination must be complete on arrival
 ## and the generator must work in the streamer's order.
-##   godot --headless --path project --script res://tests/test_streaming_lazy_flight.gd [-- size=256 length=10000 gen=20 workers=1,2,4 only=text]
-## The cruise cap follows the flight time budgets: v = d / (T - ramps), T(10 km) = 5 s, T(28 km) = 15 s, linear in between, at
-## most 2.5 km/s. It is passed to the governor explicitly (auto_cap off).
+##   godot --headless --path project --script res://tests/test_streaming_lazy_flight.gd [-- size=256 length=10000 gen=20 workers=1,2,4 only=text|text]
+## The cruise follows the governor's flight time budget (cruise_for_distance: about 6 s at 10 km, 15 s at 28 km, at most 2.5 km/s).
 const FlightGovernor := preload("res://tests/flight_governor.gd")
 const RING_RADIUS := 1000.0
 var _fail := 0
@@ -17,6 +16,7 @@ var _root_dir := "user://lazy_flight_%d" % OS.get_process_id()
 var _args := {}
 var _master := ""
 var _rows: Array[String] = []
+var _arrive := {}
 
 
 ## The game's background generator: workers take the first location of the priority list that nobody generated yet, spend
@@ -171,17 +171,6 @@ func _world_cells(rs: int, length: float) -> Array[Vector2i]:
 	return out
 
 
-## The nominal cruise speed of a flight: d / (T - ramps) with T the time budget (5 s at 10 km, 15 s at 28 km, linear, constant outside)
-## and the ramps of the jerk limited take-off and stop at the governor's acceleration; at most the 2.5 km/s hard cap
-func _cruise_cap(length: float, g: FlightGovernor) -> float:
-	var budget := 5.0 + 10.0 * clampf((length - 10000.0) / 18000.0, 0.0, 1.0)
-	var v := length / budget
-	for i in 8:
-		var ramps := v / g.max_accel + g.max_accel / g.max_jerk
-		v = length / maxf(budget - ramps, 0.5)
-	return minf(v, 2500.0)
-
-
 ## Generates a list of locations with the fake generator and waits for it. Returns the wall seconds.
 func _pregenerate(dir: String, locs: Array[Vector2i], workers: int, gen_ms: int) -> float:
 	var gen := Generator.new()
@@ -237,23 +226,36 @@ func _run() -> void:
 	if only == "" or only == "settle":
 		await _settle_report(rs, gen_ms, worker_list.back())
 	var base := {"rs": rs, "length": length, "conc": 3, "lpf": 1, "budget": 2.0, "slots": 400 if rs == 256 else 160, "gen_ms": gen_ms, "workers": 4,
-			"lazy": true, "aware": true, "eta": true, "label": ""}
+			"lazy": true, "aware": true, "eta": true, "law": "gen", "label": ""}
 	var plan: Array = []
 	var tag := "%d m %d km" % [rs, int(length / 1000.0)]
 	plan.append(_cfg(base, "%s pre-generated corridor" % tag, {"lazy": false}))
 	for wk: int in worker_list:
-		plan.append(_cfg(base, "%s lazy, %d ms x %d workers, gate aware + eta" % [tag, gen_ms, wk], {"workers": wk}))
-	plan.append(_cfg(base, "%s lazy, %d ms x %d workers, gate aware" % [tag, gen_ms, worker_list.back()], {"workers": worker_list.back(), "eta": false}))
+		plan.append(_cfg(base, "%s lazy, %d ms x %d workers, generation law + eta" % [tag, gen_ms, wk], {"workers": wk}))
+	plan.append(_cfg(base, "%s lazy, %d ms x %d workers, generation law" % [tag, gen_ms, worker_list.back()], {"workers": worker_list.back(), "eta": false}))
+	for wk: int in worker_list:
+		plan.append(_cfg(base, "%s lazy, %d ms x %d workers, gate law + eta (before)" % [tag, gen_ms, wk], {"workers": wk, "law": "gate"}))
+	plan.append(_cfg(base, "%s lazy, %d ms x %d workers, gate law (before)" % [tag, gen_ms, worker_list.back()], {"workers": worker_list.back(), "law": "gate", "eta": false}))
 	plan.append(_cfg(base, "%s lazy, %d ms x %d workers, governor unaware" % [tag, gen_ms, worker_list.back()], {"workers": worker_list.back(), "aware": false, "eta": false}))
 	plan.append(_cfg(base, "%s lazy, %d ms x 1 workers, governor unaware" % [tag, gen_ms], {"workers": 1, "aware": false, "eta": false}))
 	for cfg: Dictionary in plan:
-		if only != "" and only != "settle" and cfg.label.find(only) < 0:
+		if only != "" and only != "settle" and not _matches(cfg.label, only):
 			continue
 		if only == "settle":
 			break
 		var r: Dictionary = await _fly(cfg)
 		_rows.append(r.row)
+		_arrive[cfg.label] = r.m.complete
 		print("ROW ", r.row)
+	# The generation law against the pre-generated corridor and the gate law, in the same run
+	var wk4: int = worker_list.back()
+	var k_gen := "%s lazy, %d ms x %d workers, generation law + eta" % [tag, gen_ms, wk4]
+	var k_gate := "%s lazy, %d ms x %d workers, gate law + eta (before)" % [tag, gen_ms, wk4]
+	var k_pre := "%s pre-generated corridor" % tag
+	if _arrive.has(k_gen) and _arrive.has(k_pre):
+		ok(_arrive[k_gen] <= _arrive[k_pre] + 1.0, "%d workers generating on the way arrive within 1 s of the pre-generated flight (%.2f s against %.2f s)" % [wk4, _arrive[k_gen], _arrive[k_pre]])
+	if _arrive.has(k_gen) and _arrive.has(k_gate):
+		ok(_arrive[k_gen] <= _arrive[k_gate] + 0.6, "the generation law is not later than the gate law (%.2f s against %.2f s)" % [_arrive[k_gen], _arrive[k_gate]])
 	print("")
 	print("LAZY FLIGHT SUMMARY")
 	for row in _rows:
@@ -266,6 +268,14 @@ func _run() -> void:
 	DirAccess.remove_absolute(_root_dir)
 	print("SUITE ", "GREEN" if _fail == 0 else "RED (%d failures)" % _fail)
 	quit(0 if _fail == 0 else 1)
+
+
+## only=a|b runs the flights whose label contains a or b
+func _matches(label: String, only: String) -> bool:
+	for part in only.split("|"):
+		if label.find(part) >= 0:
+			return true
+	return false
 
 
 func _cfg(base: Dictionary, label: String, over: Dictionary) -> Dictionary:
@@ -371,8 +381,6 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			break
 	var settle_s := float(Time.get_ticks_usec() - t_settle0) * 1e-6
 	var g := FlightGovernor.new()
-	g.auto_cap = false
-	g.max_speed = _cruise_cap(length, g)
 	var heights := _heights(length)
 	g.setup(length, heights, 50.0, _ground(0.0), _ground(length))
 	var fp := FlightGovernor.view_footprint(g.cruise_altitude, g.base_pitch_deg, g.base_fov)
@@ -403,10 +411,14 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	var list_now: Array = []
 	var rank_of := {}
 	if cfg.aware and cfg.eta:
-		g.gate_eta = func(loc: Vector2i) -> float:
+		var eta_fn := func(loc: Vector2i) -> float:
 			if not rank_of.has(loc):
 				return -1.0
 			return (float(rank_of[loc]) + 1.0) * (gen_s + 0.002) / float(workers) + 0.1
+		if cfg.law == "gen":
+			g.generation_eta = eta_fn
+		else:
+			g.gate_eta = eta_fn
 	var m := {"ticks": 0, "holes": 0, "arrive": -1.0, "complete": -1.0, "first_move": -1.0, "quality_min": 1.0, "blocked_t": 0.0, "min_ready": INF,
 			"rest_t": 0.0, "peak_v": 0.0, "gen_wanted_max": 0, "generating_max": 0, "act": -1.0, "behind_gen": 0, "ring_missing": -1, "wanted_missing": -1,
 			"wasted": 0, "tick_ms": []}
@@ -421,6 +433,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 	var t_act := 2.0
 	var conc: int = cfg.conc
 	var known := {}
+	var notified := 0 # Running count of regions the generator finished and the game notified
 	for loc in cells:
 		known[loc] = true
 	while true:
@@ -441,6 +454,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			for loc in finished:
 				m.wasted += 0 if rank_of.has(loc) else 1 # No longer wanted when it was finished
 			s.notify_regions_written(finished)
+			notified += finished.size()
 		var st: Dictionary = s.get_stats()
 		var remaining := length - g.distance
 		var ready := s.get_path_ready_distance(path_id)
@@ -460,7 +474,10 @@ func _fly(cfg: Dictionary) -> Dictionary:
 				if at < held_at:
 					held_at = at
 					held_loc = gloc
-			g.observe_gate(held_at, held_loc)
+			if cfg.law == "gen":
+				g.observe_generation(dt, notified, st.generating_wanted, mpl_now, held_at, held_loc)
+			else:
+				g.observe_gate(held_at, held_loc)
 		g.observe_loader(dt, int(st.disk_loads_needed), st.inflight >= conc, mpl_now)
 		g.step(dt, ready)
 		var qi := roundi(g.quality * 20.0)
@@ -477,7 +494,7 @@ func _fly(cfg: Dictionary) -> Dictionary:
 			m.first_move = t
 		if m.first_move >= 0.0 and g.length - g.distance > 0.5 and g.speed < 5.0:
 			m.rest_t += dt
-		m.blocked_t += dt if g.gate_blocked else 0.0
+		m.blocked_t += dt if (g.gate_blocked or g.gen_blocked) else 0.0
 		var pos := start + Vector2(g.distance, 0)
 		cam.global_position = Vector3(pos.x, g.altitude, pos.y)
 		cam.basis = Basis(Vector3.UP, -PI / 2.0) * Basis(Vector3.RIGHT, g.pitch)
@@ -585,7 +602,8 @@ func _fly(cfg: Dictionary) -> Dictionary:
 		ok(st_end.failed == 0, "%s: no region ever failed to load (%d)" % [label, st_end.failed])
 		ok(m.wasted * 10 <= maxi(gen.written, 1), "%s: the generator worked on what the streamer wanted (%d of %d finished regions were no longer wanted)" % [label, m.wasted, gen.written])
 		ok(back_steps * 10 <= maxi(steps, 1), "%s: and in its order, mostly forward along the route (%d of %d steps went back more than 3 regions)" % [label, back_steps, steps])
-		if cfg.aware:
+		if cfg.aware and cfg.law == "gen" and workers >= 4:
+			# A generator that keeps up with the cruise costs no quality; a slower one (1-2 workers at 256 m) shrinks the footprint on purpose
 			ok(m.quality_min >= 0.99, "%s: generation lag is not read as a slow loader, the footprint quality stays at %.2f" % [label, m.quality_min])
 	s.clear_keep()
 	s.behind_limit = -1.0
