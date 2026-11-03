@@ -222,14 +222,32 @@ Vector2 Terrain3DUtil::get_min_max(const Ref<Image> &p_image) {
 
 	Vector2 min_max = Vector2(FLT_MAX, -FLT_MAX);
 
-	for (int y = 0; y < p_image->get_height(); y++) {
-		for (int x = 0; x < p_image->get_width(); x++) {
-			Color col = p_image->get_pixel(x, y);
-			if (col.r < min_max.x) {
-				min_max.x = col.r;
+	if (p_image->get_format() == Image::FORMAT_RF) {
+		// Read the floats directly. get_pixel() per texel is about 30 ms for a 1024x1024 image
+		const PackedByteArray data = p_image->get_data();
+		const int64_t count = int64_t(p_image->get_width()) * p_image->get_height();
+		if (data.size() >= count * int64_t(sizeof(float))) {
+			const float *pixels = reinterpret_cast<const float *>(data.ptr());
+			for (int64_t i = 0; i < count; i++) {
+				const float r = pixels[i];
+				if (r < min_max.x) {
+					min_max.x = r;
+				}
+				if (r > min_max.y) {
+					min_max.y = r;
+				}
 			}
-			if (col.r > min_max.y) {
-				min_max.y = col.r;
+		}
+	} else {
+		for (int y = 0; y < p_image->get_height(); y++) {
+			for (int x = 0; x < p_image->get_width(); x++) {
+				Color col = p_image->get_pixel(x, y);
+				if (col.r < min_max.x) {
+					min_max.x = col.r;
+				}
+				if (col.r > min_max.y) {
+					min_max.y = col.r;
+				}
 			}
 		}
 	}
