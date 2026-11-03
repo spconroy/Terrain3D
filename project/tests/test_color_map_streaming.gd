@@ -33,7 +33,8 @@ func _settle(max_frames: int) -> void:
 		await process_frame
 		RenderingServer.emit_signal("frame_pre_draw")
 		var n: int = _t.data.get_region_count()
-		if n == last:
+		# Also wait for the worker thread saves of evicted regions: the persist checks read those files
+		if n == last and int(_t.get_streaming_stats().get("saving", 0)) == 0:
 			stable += 1
 			if stable >= 15:
 				return
@@ -178,7 +179,17 @@ func _run() -> void:
 			await _stream(d, enabled, Terrain3D.COMPRESS_S3TC, keep)
 			ok(_t.data.get_region_count() == 9, "%s: ring loaded" % tag)
 			ok((_t.data.get_color_maps_rid() != RID()) == enabled, "%s: color array presence" % tag)
-			if enabled:
+			if enabled and not keep:
+				# A compressed streaming pool takes the compressed map as it is and frees the uncompressed copy
+				# (keep_uncompressed_color false), so per pixel reads give NaN: read the compressed map instead
+				var rc: Terrain3DRegion = _t.data.get_region(Vector2i(0, 0))
+				var cm: Image = rc.get_compressed_color_map().duplicate() if rc != null and rc.is_color_compressed() else null
+				if cm != null:
+					cm.decompress()
+				var cpx: Color = cm.get_pixel(10, 10) if cm != null else Color(NAN, NAN, NAN, NAN)
+				ok(rc != null and rc.get_color_map() == null and absf(cpx.r - _sig(0, 0).r) < 0.08 and absf(cpx.g - _sig(0, 0).g) < 0.08,
+						"%s: streamed color correct in the compressed map, uncompressed freed (%s)" % [tag, cpx])
+			elif enabled:
 				var px: Color = _t.data.get_pixel(Terrain3DRegion.TYPE_COLOR, centre)
 				ok(absf(px.r - _sig(0, 0).r) < 0.08 and absf(px.g - _sig(0, 0).g) < 0.08, "%s: streamed color correct (%s)" % [tag, px])
 			ok(_t.data.get_free_slot_count() + _t.data.get_region_count() == 25, "%s: no slot leaked" % tag)
