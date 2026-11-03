@@ -151,6 +151,11 @@ func _gate_nothing(_loc: Vector2i) -> void:
 
 func _run() -> void:
 	process_frame.disconnect(_run)
+	if OS.get_environment("T3D_ONLY_FLIGHT") != "":
+		await _test_flight() # Tuning runs
+		print("SUITE ", "GREEN" if _fail == 0 else "RED (%d failures)" % _fail)
+		quit(0 if _fail == 0 else 1)
+		return
 	await _test_default_parity()
 	await _test_hold_and_release()
 	await _test_order()
@@ -667,7 +672,7 @@ func _test_rescan_abort() -> void:
 
 # 16. The governed flight: the gate withholds the destination until the 'trees are ready'. The governor, which
 # gets its limit from get_path_ready_distance(), slows and hovers instead of showing bare terrain.
-func _flight(p_gated: bool, p_governed: bool, p_release_s: float) -> Dictionary:
+func _flight(p_gated: bool, p_governed: bool, p_release_s: float, p_aware: bool = false, p_eta: bool = false) -> Dictionary:
 	var dir := _root_dir + "/flight"
 	var cam := await _new_terrain(dir, 160, 2)
 	var s := _streamer()
@@ -680,6 +685,9 @@ func _flight(p_gated: bool, p_governed: bool, p_release_s: float) -> Dictionary:
 	g.max_accel = 300.0
 	g.max_jerk = 1500.0
 	g.safety = 3.0 * sp
+	g.gate_aware = p_aware
+	if p_eta:
+		g.gate_eta = func(_loc: Vector2i) -> float: return maxf(float(_release_ms - Time.get_ticks_msec()) * 0.001, 0.0)
 	var heights := PackedFloat32Array()
 	for i in int(length / 50.0) + 1:
 		heights.append(5.0)
@@ -705,7 +713,8 @@ func _flight(p_gated: bool, p_governed: bool, p_release_s: float) -> Dictionary:
 			break
 	var t0 := Time.get_ticks_msec()
 	_release_ms = t0 + int(p_release_s * 1000.0)
-	var m := {"holes": 0, "released_at": p_release_s, "arrive": -1.0, "max_x_before_release": 0.0, "hover_frames": 0, "gated_seen_early": 0, "frames": 0}
+	var m := {"holes": 0, "released_at": p_release_s, "arrive": -1.0, "max_x_before_release": 0.0, "hover_frames": 0, "gated_seen_early": 0, "frames": 0, "quality_min": 1.0, "blocked_t": 0.0, "slow_frames": 0}
+	var conc: int = _t.streaming_concurrent_loads
 	var prev := Time.get_ticks_usec()
 	var t := 0.0
 	while true:
@@ -715,7 +724,24 @@ func _flight(p_gated: bool, p_governed: bool, p_release_s: float) -> Dictionary:
 		var dt := clampf(float(now - prev) * 1e-6, 1.0 / 240.0, 1.0 / 20.0)
 		prev = now
 		t = float(Time.get_ticks_msec() - t0) * 0.001
+		if p_governed and p_gated:
+			# What a game feeds the governor: the loader's throughput and where the nearest held region enters the corridor
+			var st := s.get_stats()
+			var held_at := INF
+			var held_loc = null
+			for gloc: Vector2i in s.get_gated_regions():
+				var gx := float(gloc.x) * sp - start.x - radius
+				if float(gloc.x + 1) * sp >= start.x + g.distance and absf((float(gloc.y) + 0.5) * sp - start.y) <= radius + 0.5 * sp and maxf(gx, g.distance) < held_at:
+					held_at = maxf(gx, g.distance)
+					held_loc = gloc
+			g.observe_loader(dt, int(st.disk_loads_needed), st.inflight >= conc, sp)
+			if p_aware:
+				g.observe_gate(held_at, held_loc)
 		g.step(dt, s.get_path_ready_distance(id) if p_governed else INF)
+		m.quality_min = minf(m.quality_min, g.quality)
+		m.blocked_t += dt if g.gate_blocked else 0.0
+		if g.distance > 0.0 and g.speed < 30.0 and g.distance < length - 0.5:
+			m.slow_frames += 1
 		var x := start.x + g.distance
 		cam.global_position = Vector3(x, g.altitude, start.y)
 		m.frames += 1
@@ -741,6 +767,8 @@ func _flight(p_gated: bool, p_governed: bool, p_release_s: float) -> Dictionary:
 			break
 	m.done = g.is_done(_t.data.has_region(Vector2i(22, 0)))
 	m.clamp_hits = g.clamp_hits
+	m.limit_seen = g.limit_seen
+	m.rate_est = g.rate_est if g.rate_valid else -1.0
 	m.margin = g.min_ready_margin
 	m.t_end = t
 	m.gated_end = s.get_stats().gated
@@ -768,6 +796,18 @@ func _test_flight() -> void:
 	ok(gated.max_x_before_release <= (18.0 - 1.2 - 3.0) * float(RS) + 10.0, "flight: it never went within safety of the first gated chunk (x %.0f)" % gated.max_x_before_release)
 	ok(gated.arrive > release - 0.5, "flight: it arrived only once the chunks were released (arrive %.1f s, release %.1f s, free flight %.1f s)" % [gated.arrive, release, free.arrive])
 	ok(gated.t_end < release + 12.0, "flight: and landed soon after (%.1f s)" % gated.t_end)
+	print("FLIGHT gated, quality min %.2f (unaware governor fed with the loader's throughput)" % gated.quality_min)
+	# Gate aware: the same flight with the held regions fed to the governor (and the exact release time as the eta). The footprint quality
+	# stays at 1 and the loader's rate is not misread; the camera still never sees bare terrain
+	for with_eta: bool in [false, true]:
+		var aw := await _flight(true, true, release, true, with_eta)
+		var tag := "gate aware" + (" + eta" if with_eta else "")
+		print("FLIGHT %s: " % tag, aw)
+		ok(aw.done and aw.holes == 0 and aw.clamp_hits == 0, "flight %s: lands (%.1f s), no bare terrain (%d frames), the failsafe clamp never held the camera" % [tag, aw.t_end, aw.holes])
+		ok(aw.quality_min == 1.0, "flight %s: the held regions are not read as a slow loader, the footprint quality stays at %.2f" % [tag, aw.quality_min])
+		ok(aw.blocked_t > 2.0, "flight %s: the governor recognised the held regions at its front (%.1f s)" % [tag, aw.blocked_t])
+		ok(aw.gated_seen_early == 0 and aw.max_x_before_release <= (18.0 - 1.2 - 3.0) * float(RS) + 10.0, "flight %s: no gated chunk visible before the release, the camera stayed behind the safety distance (x %.0f)" % [tag, aw.max_x_before_release])
+		ok(aw.arrive > release - 0.5 and aw.t_end < release + 12.0, "flight %s: it arrives only once the chunks are released and lands soon after (arrive %.1f s, landed %.1f s, release %.1f s)" % [tag, aw.arrive, aw.t_end, release])
 	# Ungoverned: the same gate makes the camera fly into bare terrain, which is what the governor prevents
 	var naive := await _flight(true, false, release)
 	print("FLIGHT naive: ", naive)
