@@ -9,6 +9,7 @@
 		For long camera flights see [method set_keep_path_ahead], [member behind_limit], [method get_path_ready_distance] and [method get_path_cost]. A flight keeps a path, a forward cone and (late) a destination circle, limits the path to a lookahead segment, sets [member behind_limit] to one region, and a game side governor limits the camera speed to what [method get_path_ready_distance] shows is visible. Preloading the destination only when time to arrival drops below the time it needs to load, and the rest of the corridor as cached bodies when memory allows, is up to the caller. Suspend dynamic collision during a long flight with [code skip-lint]collision_mode = Terrain3DCollision.DISABLED[/code] (set after the node is in the tree) and restore it at landing, or each landed region near the fast moving target triggers a collision refresh of about 25 ms.
 		When a shape shrinks (a smaller radius, length or width, a shorter path) or is removed, or [member camera_scale] decreases, the next step evicts every region outside the new keep set at once, saving edited regions through the same worker thread as any eviction if [member persist_edits] is on (the early eviction is not limited by [member frame_budget_ms]), and drops loads still in flight for them. That keep set becomes the hysteresis baseline. Callers that want a gradual release lower the size a little each frame. Moving or growing a shape evicts nothing early.
 		For terrain that must not show before the things on it are ready (trees, buildings, foliage) set an [member insert_gate]. Each step it is asked, for the regions that finished loading and are next to be inserted, whether the region may become visible. A region it refuses waits as a body in the RAM cache, holds no slot of the pool, takes none of the insertion budget ([member frame_budget_ms], [member loads_per_frame]) and does not delay the regions behind it. [method get_path_ready_distance] counts only visible regions, so a game side governor slows the camera for the gate by itself. See [member gate_timeout_ms] and [method get_gated_regions].
+		For worlds whose region files are generated while the game runs, the game registers the locations that exist in the world but have no file yet with [method register_pending_locations]. The streamer never requests them, so there is no failed state, retry or log message, but they count as wanted and missing ([method get_path_ready_distance] ends before them, [code skip-lint]nearest_missing[/code] sees them), so a camera governor slows for them like for slow loading. [method get_wanted_pending] lists the ones wanted now in load order, for the game's generator to work through. After the generator wrote a region file (atomically: a temporary name, then a rename) it calls [method notify_region_written]; the location is then known without scanning the directory and loads by the normal priority. A pending location is never written by [member persist_edits]: its file belongs to the generator. The statistics [code skip-lint]generating[/code] and [code skip-lint]generating_wanted[/code] tell a generator that is behind from a loader that is behind.
 		Settings are exposed as aliases on the [Terrain3D] node (e.g. [member Terrain3D.streaming_enabled]), which is also where they are saved. Streaming only runs outside the editor; the editor always keeps the full terrain loaded.
 	</description>
 	<tutorials>
@@ -55,6 +56,12 @@
 				Removes every keep shape and resets [member camera_scale] to 1, restoring the default loaded area. Regions outside it evict at the next step.
 			</description>
 		</method>
+		<method name="clear_pending_locations">
+			<return type="void" />
+			<description>
+				Forgets every location registered with [method register_pending_locations], e.g. when the world is replaced. Nothing is loaded or evicted by this.
+			</description>
+		</method>
 		<method name="clear_virtual_locations">
 			<return type="void" />
 			<description>
@@ -90,7 +97,7 @@
 			<param index="0" name="points" type="PackedVector3Array" />
 			<param index="1" name="radius" type="float" />
 			<description>
-				Estimates what a corridor of [param radius] world units around a polyline costs to hold, so a caller can compare it with a memory budget before prefetching it. Returns [code skip-lint]length[/code] (meters along the polyline), [code skip-lint]cells[/code] (regions the corridor touches), [code skip-lint]regions[/code] (those with a file), [code skip-lint]region_bytes[/code] (the raw size of one region body: region_size squared times 4 bytes for each of height, control and, if [member Terrain3D.color_map_enabled] is on, color), [code skip-lint]bytes[/code] (regions times region_bytes, the RAM cache cost of holding every body) and [code skip-lint]outside_window[/code] (regions beyond the region map window now, which can only be cached until the window reaches them).
+				Estimates what a corridor of [param radius] world units around a polyline costs to hold, so a caller can compare it with a memory budget before prefetching it. Returns [code skip-lint]length[/code] (meters along the polyline), [code skip-lint]cells[/code] (regions the corridor touches), [code skip-lint]regions[/code] (those with a file), [code skip-lint]region_bytes[/code] (the raw size of one region body: region_size squared times 4 bytes for each of height, control and, if [member Terrain3D.color_map_enabled] is on, color), [code skip-lint]bytes[/code] (regions times region_bytes, the RAM cache cost of holding every body) and [code skip-lint]outside_window[/code] (regions beyond the region map window now, which can only be cached until the window reaches them). [code skip-lint]generating[/code] counts pending locations on the path (see [method register_pending_locations]); they are not in [code skip-lint]regions[/code] yet.
 			</description>
 		</method>
 		<method name="get_path_ready_distance" qualifiers="const">
@@ -100,6 +107,12 @@
 			<description>
 				Returns the meters along the path [param id], from the clipmap target's position on it (or from [param from_distance] meters along the path if it is not negative), to the first region the path corridor needs that is not visible yet, or to the end of the path if all are. Only regions inserted into the region map count: a body waiting in the RAM cache or partway through a budgeted insertion is not visible. Regions behind the starting point, without a file, or given up on after repeated failures are skipped. Returns -1 for an unknown id.
 				A game side camera governor uses it to never outrun the loaded terrain: the camera may only fly at a speed from which it can still stop inside the ready distance less a safety margin, [code skip-lint]speed_limit = sqrt(2 * brake * (ready_distance - safety))[/code], which gives [code skip-lint]ready_distance / lookahead_seconds[/code] at a steady flight. The distance is measured to the entry of the first missing region into the corridor, so a missing region is reported early by up to the corridor radius.
+			</description>
+		</method>
+		<method name="get_pending_locations" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Returns every location (Vector2i) registered with [method register_pending_locations] whose file has not been announced yet, wanted or not. Not to be confused with [method get_pending_regions], the loads in flight.
 			</description>
 		</method>
 		<method name="get_pending_regions" qualifiers="const">
@@ -115,6 +128,13 @@
 				How many pool slots the given distance needs with the current [member shape], including the one region hysteresis band. Square: (2 * (distance + 1) + 1)².
 			</description>
 		</method>
+		<method name="get_wanted_pending" qualifiers="const">
+			<return type="Array" />
+			<param index="0" name="max" type="int" default="64" />
+			<description>
+				Returns up to [param max] pending locations (Vector2i, see [method register_pending_locations]) that the last step wanted, in the order the loads would run if their files existed: regions needed now before those only fetched ahead of a path's reach, regions ahead of the direction of travel before those behind it, then destination shapes, paths in order of arrival from the clipmap target, and everything else nearest first. A generator that works through this list generates exactly what the streamer needs next, without knowing the keep set. Locations announced with [method notify_region_written] since the last step are left out. It copies at most [param max] entries and can be called every frame.
+			</description>
+		</method>
 		<method name="get_wanted_regions" qualifiers="const">
 			<return type="Array" />
 			<param index="0" name="cache_only" type="bool" default="false" />
@@ -125,13 +145,35 @@
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns live streaming counters: [code skip-lint]streaming_active[/code], [code skip-lint]resident[/code], [code skip-lint]free_slots[/code], [code skip-lint]inflight[/code], [code skip-lint]staged[/code] (regions partway through a budgeted insertion), [code skip-lint]saving[/code] (evicted regions being written to disk), [code skip-lint]failed[/code] (locations whose load failed; each is requested again every few seconds, then ignored after three failures until [method scan_directory]), [code skip-lint]known[/code], [code skip-lint]landed_total[/code], [code skip-lint]evicted_total[/code], and [code skip-lint]land_ms_avg[/code] (an exponential moving average of an insertion's main thread cost in ms), and for the keep set [code skip-lint]keep_shapes[/code], [code skip-lint]wanted[/code] (known regions inside it), [code skip-lint]missing[/code] (wanted, inside the region map window, not resident yet), [code skip-lint]deferred[/code] (wanted but the slot pool cannot hold them) [code skip-lint]outside_window[/code] (wanted but beyond the region map window, waiting in the RAM cache), [code skip-lint]nearest_missing[/code] (meters from the clipmap target to the nearest wanted region that is not visible yet and not behind the direction of travel, -1 if none), [code skip-lint]recentres[/code] (region map window moves so far), [code skip-lint]collision_refreshes[/code] (dynamic collision refreshes the streamer asked for), and [code skip-lint]disk_loads_needed[/code] (threaded loads consumed for regions needed now: not bodies fetched ahead of a path's reach and not RAM cache insertions, so its rate against the clipmap target's travel is the loader's sustainable throughput), and for the [member insert_gate] [code skip-lint]gated[/code] (loaded regions it holds back now), [code skip-lint]gate_timeouts[/code] (regions inserted anyway after [member gate_timeout_ms]) and [code skip-lint]gate_wait_ms_max[/code] (the longest a region was held, waiting now or inserted since). A gated region counts as [code skip-lint]missing[/code] and as [code skip-lint]nearest_missing[/code]; it is not [code skip-lint]resident[/code]. [method scan_directory] resets the timeout and wait counters, like [code skip-lint]landed_total[/code]. Useful for debug overlays and tests.
+				Returns live streaming counters: [code skip-lint]streaming_active[/code], [code skip-lint]resident[/code], [code skip-lint]free_slots[/code], [code skip-lint]inflight[/code], [code skip-lint]staged[/code] (regions partway through a budgeted insertion), [code skip-lint]saving[/code] (evicted regions being written to disk), [code skip-lint]failed[/code] (locations whose load failed; each is requested again every few seconds, then ignored after three failures until [method scan_directory]), [code skip-lint]known[/code], [code skip-lint]landed_total[/code], [code skip-lint]evicted_total[/code], and [code skip-lint]land_ms_avg[/code] (an exponential moving average of an insertion's main thread cost in ms), and for the keep set [code skip-lint]keep_shapes[/code], [code skip-lint]wanted[/code] (known regions inside it), [code skip-lint]missing[/code] (wanted, inside the region map window, not resident yet), [code skip-lint]deferred[/code] (wanted but the slot pool cannot hold them) [code skip-lint]outside_window[/code] (wanted but beyond the region map window, waiting in the RAM cache), [code skip-lint]nearest_missing[/code] (meters from the clipmap target to the nearest wanted region that is not visible yet and not behind the direction of travel, -1 if none), [code skip-lint]recentres[/code] (region map window moves so far), [code skip-lint]collision_refreshes[/code] (dynamic collision refreshes the streamer asked for), and [code skip-lint]disk_loads_needed[/code] (threaded loads consumed for regions needed now: not bodies fetched ahead of a path's reach and not RAM cache insertions, so its rate against the clipmap target's travel is the loader's sustainable throughput), and for the [member insert_gate] [code skip-lint]gated[/code] (loaded regions it holds back now), [code skip-lint]gate_timeouts[/code] (regions inserted anyway after [member gate_timeout_ms]) and [code skip-lint]gate_wait_ms_max[/code] (the longest a region was held, waiting now or inserted since). [code skip-lint]generating[/code] (pending locations, see [method register_pending_locations]) and [code skip-lint]generating_wanted[/code] (of those, the ones needed now: wanted, not behind the direction of travel, not only fetched ahead of a path's reach). Pending locations are counted in [code skip-lint]wanted[/code], [code skip-lint]missing[/code] (inside the window), [code skip-lint]outside_window[/code] and [code skip-lint]nearest_missing[/code] like any wanted region, but never in the loader counters. A gated region counts as [code skip-lint]missing[/code] and as [code skip-lint]nearest_missing[/code]; it is not [code skip-lint]resident[/code]. [method scan_directory] resets the timeout and wait counters, like [code skip-lint]landed_total[/code]. Useful for debug overlays and tests.
 			</description>
 		</method>
 		<method name="is_active" qualifiers="const">
 			<return type="bool" />
 			<description>
 				Returns [code skip-lint]true[/code] when streaming is enabled and the game is running outside the editor.
+			</description>
+		</method>
+		<method name="notify_region_written">
+			<return type="void" />
+			<param index="0" name="location" type="Vector2i" />
+			<param index="1" name="path" type="String" default="&quot;&quot;" />
+			<description>
+				Announces that the file of a location is complete. Call it on the main thread after writing the file atomically (write to a temporary name, then rename), so a load never sees a partial file. The location leaves the pending set and becomes known without scanning the data directory; the streamer requests it by the normal priority if it is wanted. [param path] names the file when it is not the data directory's own name for the location ([method Terrain3DUtil.location_to_filename]); such a path survives [method scan_directory]. Also works for a location that was never pending, and clears a failed state of the location so a rewritten file is requested again.
+			</description>
+		</method>
+		<method name="notify_regions_written">
+			<return type="void" />
+			<param index="0" name="locations" type="Array[Vector2i]" />
+			<description>
+				Calls [method notify_region_written] for every location of the array. Entries that are not a Vector2i are skipped.
+			</description>
+		</method>
+		<method name="register_pending_locations">
+			<return type="void" />
+			<param index="0" name="locations" type="Array[Vector2i]" />
+			<description>
+				Registers locations that belong to the world but whose region file the game has not generated yet. They are wanted when inside the keep set but are never requested: no load, no failed state, no retry. They count as missing in [method get_stats], in [code skip-lint]nearest_missing[/code] and in [method get_path_ready_distance], and are not part of [code skip-lint]known[/code], [code skip-lint]disk_loads_needed[/code] or the other loader counters. Locations the streamer already knows (a file on disk, a virtual location) or holds resident are skipped. The set survives [method scan_directory] and [method abort_pending]; a location whose file the scan finds leaves it. A pending location that leaves the keep set is simply not wanted, it stays registered. See [method notify_region_written] and [method get_wanted_pending].
 			</description>
 		</method>
 		<method name="register_virtual_locations">
