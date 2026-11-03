@@ -120,6 +120,13 @@ private:
 	HashMap<Vector2i, Resolved> _resolved; // Pending locations that used the resolver
 	HashSet<Vector2i> _virtual; // Locations registered without a file of their own
 
+	// Locations the game will generate: wanted like any known location, but with no file yet, so never requested,
+	// never failed. They count as missing until notify_region_written() makes them known.
+	HashSet<Vector2i> _lazy;
+	HashMap<Vector2i, String> _paths; // Written locations whose file is not the data directory's own name for it
+	Vector<Vector2i> _wanted_lazy; // Wanted pending locations of the last step in load order
+	int _stat_generating_wanted = 0;
+
 	// Work data
 	Vector<Vector2i> _known; // Region locations present on disk
 	HashSet<Vector2i> _known_set;
@@ -190,6 +197,8 @@ private:
 	void _mark_failed(const Vector2i &p_region_loc, const bool p_give_up = false);
 	bool _is_failed(const Vector2i &p_region_loc) const;
 	Error _request_load(const Vector2i &p_loc, const String &p_dir);
+	String _file_path(const Vector2i &p_loc, const String &p_dir) const;
+	void _sync_pending();
 	void _finish_body(const Ref<Terrain3DRegion> &p_region, const Vector2i &p_loc, const String &p_path);
 
 public:
@@ -255,6 +264,12 @@ public:
 	Callable get_resolver() const { return _resolver; }
 	void register_virtual_locations(const TypedArray<Vector2i> &p_locations);
 	void clear_virtual_locations();
+	void register_pending_locations(const Array &p_locations);
+	void clear_pending_locations();
+	TypedArray<Vector2i> get_pending_locations() const;
+	TypedArray<Vector2i> get_wanted_pending(const int p_max = 64) const;
+	void notify_region_written(const Vector2i &p_location, const String &p_path = String());
+	void notify_regions_written(const Array &p_locations);
 
 	void scan_directory();
 	void step();

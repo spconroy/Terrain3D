@@ -121,9 +121,8 @@ void Terrain3DStreamer::_flush_ram_cache() {
 	// persists on its own (see Terrain3DData::evict_region).
 	if (_terrain != nullptr && _persist_edits && !_terrain->get_data_directory().is_empty()) {
 		for (const KeyValue<Vector2i, Ref<Terrain3DRegion>> &kv : _ram_cache) {
-			if (kv.value.is_valid() && kv.value->is_modified() && !kv.value->is_read_only()) {
-				String path = _terrain->get_data_directory() + String("/") + Util::location_to_filename(kv.key);
-				kv.value->save(path, _terrain->get_save_16_bit());
+			if (kv.value.is_valid() && kv.value->is_modified() && !kv.value->is_read_only() && !_lazy.has(kv.key)) {
+				kv.value->save(_file_path(kv.key, _terrain->get_data_directory()), _terrain->get_save_16_bit());
 			}
 		}
 	}
@@ -168,6 +167,7 @@ void Terrain3DStreamer::register_virtual_locations(const TypedArray<Vector2i> &p
 	for (int i = 0; i < p_locations.size(); i++) {
 		Vector2i loc = p_locations[i];
 		_virtual.insert(loc);
+		_lazy.erase(loc);
 		if (!_known_set.has(loc)) {
 			_known.push_back(loc);
 			_known_set.insert(loc);
@@ -178,6 +178,108 @@ void Terrain3DStreamer::register_virtual_locations(const TypedArray<Vector2i> &p
 void Terrain3DStreamer::clear_virtual_locations() {
 	_virtual.clear();
 	scan_directory();
+}
+
+// Lazily generated regions. The game registers locations that belong to the world but whose file it has not
+// written yet. They are wanted like any known location, so they appear in the keep set statistics, count as
+// missing (get_path_ready_distance, nearest_missing, missing) and are listed by get_wanted_pending() in load
+// order, but the streamer never requests them: no load, no failure, no retry. The game writes the file
+// atomically and calls notify_region_written(), after which the location is loaded like any other.
+// Locations the streamer already knows, or holds resident, are not pending and are skipped.
+void Terrain3DStreamer::register_pending_locations(const Array &p_locations) {
+	Terrain3DData *data = _terrain != nullptr ? _terrain->get_data() : nullptr;
+	for (int i = 0; i < p_locations.size(); i++) {
+		if (p_locations[i].get_type() != Variant::VECTOR2I) {
+			continue;
+		}
+		const Vector2i loc = p_locations[i];
+		if (abs(loc.x) > Terrain3DRegion::MAX_LOCATION || abs(loc.y) > Terrain3DRegion::MAX_LOCATION) {
+			continue;
+		}
+		if (_known_set.has(loc) || (data != nullptr && data->has_region(loc))) {
+			continue;
+		}
+		_lazy.insert(loc);
+		_failed.erase(loc);
+		_fail_count.erase(loc);
+	}
+}
+
+// Forgets every pending location, e.g. when the world is replaced. Nothing is loaded or evicted by this.
+void Terrain3DStreamer::clear_pending_locations() {
+	_lazy.clear();
+	_wanted_lazy.clear();
+	_stat_generating_wanted = 0;
+}
+
+TypedArray<Vector2i> Terrain3DStreamer::get_pending_locations() const {
+	TypedArray<Vector2i> out;
+	for (const Vector2i &loc : _lazy) {
+		out.push_back(loc);
+	}
+	return out;
+}
+
+// The pending locations the last step() wanted, in the order loads would run: destination shapes first, then
+// paths in order of arrival, then everything else nearest first, regions behind the direction of travel and
+// those only fetched ahead of a path's reach last. Locations notified since are left out.
+TypedArray<Vector2i> Terrain3DStreamer::get_wanted_pending(const int p_max) const {
+	TypedArray<Vector2i> out;
+	for (int i = 0; i < _wanted_lazy.size() && out.size() < p_max; i++) {
+		if (_lazy.has(_wanted_lazy[i])) {
+			out.push_back(_wanted_lazy[i]);
+		}
+	}
+	return out;
+}
+
+// The game wrote the file of a location (atomically: a complete file under its final name). It leaves the pending
+// set and becomes known without scanning the directory; the streamer requests it by the normal priority. The
+// optional path names the file when it is not the data directory's own name for the location. Also usable for a
+// location that was never pending, and for one that failed to load before: the failure is forgotten.
+void Terrain3DStreamer::notify_region_written(const Vector2i &p_location, const String &p_path) {
+	if (abs(p_location.x) > Terrain3DRegion::MAX_LOCATION || abs(p_location.y) > Terrain3DRegion::MAX_LOCATION) {
+		return;
+	}
+	_lazy.erase(p_location);
+	if (p_path.is_empty()) {
+		_paths.erase(p_location);
+	} else {
+		_paths[p_location] = p_path;
+	}
+	_failed.erase(p_location);
+	_fail_count.erase(p_location);
+	if (!_known_set.has(p_location)) {
+		_known.push_back(p_location);
+		_known_set.insert(p_location);
+	}
+}
+
+void Terrain3DStreamer::notify_regions_written(const Array &p_locations) {
+	for (int i = 0; i < p_locations.size(); i++) {
+		if (p_locations[i].get_type() == Variant::VECTOR2I) {
+			notify_region_written(p_locations[i]);
+		}
+	}
+}
+
+// Files found by a scan and locations written with their own path are no longer pending
+void Terrain3DStreamer::_sync_pending() {
+	for (const KeyValue<Vector2i, String> &kv : _paths) {
+		if (!_known_set.has(kv.key)) {
+			_known.push_back(kv.key);
+			_known_set.insert(kv.key);
+		}
+	}
+	Vector<Vector2i> found;
+	for (const Vector2i &loc : _lazy) {
+		if (_known_set.has(loc)) {
+			found.push_back(loc);
+		}
+	}
+	for (int i = 0; i < found.size(); i++) {
+		_lazy.erase(found[i]);
+	}
 }
 
 // The insert gate decides when a loaded region may become visible: Callable(location: Vector2i) -> bool.
@@ -226,6 +328,7 @@ void Terrain3DStreamer::scan_directory() {
 	}
 	String dir = _terrain->get_data_directory();
 	if (dir.is_empty()) {
+		_sync_pending();
 		return;
 	}
 	PackedStringArray files = Util::get_files(dir, "terrain3d*.res");
@@ -244,6 +347,7 @@ void Terrain3DStreamer::scan_directory() {
 			_known_set.insert(loc);
 		}
 	}
+	_sync_pending();
 	LOG(INFO, "Streaming scan: ", _known.size(), " regions on disk at ", dir);
 }
 
@@ -357,6 +461,7 @@ void Terrain3DStreamer::step() {
 		real_t cam_d = 0.f;
 		bool behind = false;
 		bool cache_only = false; // Body only: beyond the reach of a path, requested after everything that is needed
+		bool lazy = false; // Pending: the game has not generated its file yet, never requested
 		real_t defer = 0.f;
 	};
 	struct WantSort {
@@ -398,11 +503,13 @@ void Terrain3DStreamer::step() {
 	HashMap<Vector2i, Want> wanted;
 	// p_defer < 0 means the distance to the target in meters. A path passes its arrival distance.
 	auto add_want = [&](const Vector2i &p_loc, int p_tier, real_t p_rank, real_t p_ahead, bool p_behind, real_t p_defer = -1.f, bool p_cache_only = false) {
-		if (!_known_set.has(p_loc) || _is_failed(p_loc)) {
+		const bool lazy = _lazy.has(p_loc);
+		if (lazy ? data->has_region(p_loc) : (!_known_set.has(p_loc) || _is_failed(p_loc))) {
 			return;
 		}
 		Want w;
 		w.loc = p_loc;
+		w.lazy = lazy;
 		w.tier = p_tier;
 		w.rank = p_rank;
 		w.ahead = p_ahead;
@@ -477,21 +584,38 @@ void Terrain3DStreamer::step() {
 		}
 	}
 	// Split by the region map window; only regions inside it can take a slot
+	// Pending locations count as wanted and missing but take no slot until their file exists
 	Vector<Want> in_window;
+	Vector<Want> lazy_wants;
 	int outside = 0;
+	int lazy_missing = 0;
 	_wanted_near.clear();
 	_wanted_cache.clear();
 	for (const KeyValue<Vector2i, Want> &kv : wanted) {
+		if (kv.value.lazy) {
+			lazy_wants.push_back(kv.value);
+		}
 		if (kv.value.cache_only) {
 			_wanted_cache.push_back(kv.key);
 			continue;
 		}
 		_wanted_near.push_back(kv.key);
-		if (data->get_region_map_index(kv.key) >= 0) {
+		const bool in_map = data->get_region_map_index(kv.key) >= 0;
+		if (kv.value.lazy) {
+			lazy_missing += in_map ? 1 : 0;
+			outside += in_map ? 0 : 1;
+		} else if (in_map) {
 			in_window.push_back(kv.value);
 		} else {
 			outside++;
 		}
+	}
+	lazy_wants.sort_custom<WantSort>();
+	_wanted_lazy.clear();
+	_stat_generating_wanted = 0;
+	for (int i = 0; i < lazy_wants.size(); i++) {
+		_wanted_lazy.push_back(lazy_wants[i].loc);
+		_stat_generating_wanted += (lazy_wants[i].cache_only || lazy_wants[i].behind) ? 0 : 1;
 	}
 	// A pool smaller than the union keeps what is needed first and defers the rest: regions ahead
 	// of the direction of travel before regions behind it, nearest first, a path by arrival
@@ -528,7 +652,7 @@ void Terrain3DStreamer::step() {
 				missing++;
 			}
 		}
-		_stat_missing = missing;
+		_stat_missing = missing + lazy_missing;
 		int freeing = _keep_dirty ? (int)stale.size() : MIN((int)stale.size(), 8);
 		int short_by = missing - data->get_free_slot_count() - freeing;
 		if (short_by > 0) {
@@ -553,7 +677,7 @@ void Terrain3DStreamer::step() {
 			}
 		}
 	} else {
-		_stat_missing = 0;
+		_stat_missing = lazy_missing;
 	}
 	const int evict_limit = _keep_dirty ? (int)stale.size() : 8;
 	for (int i = 0; i < stale.size() && i < evict_limit; i++) {
@@ -679,7 +803,7 @@ void Terrain3DStreamer::step() {
 	if (gating) {
 		for (const KeyValue<Vector2i, Want> &kv : wanted) {
 			const Vector2i &loc = kv.key;
-			if (kv.value.cache_only || !_ram_cache.has(loc) || data->get_region_map_index(loc) < 0 || deferred.has(loc) ||
+			if (kv.value.cache_only || kv.value.lazy || !_ram_cache.has(loc) || data->get_region_map_index(loc) < 0 || deferred.has(loc) ||
 					resident.has(loc) || data->has_region(loc) || _is_failed(loc) || _pending.has(loc) ||
 					_staged_set.has(loc) || _saving.has(loc)) {
 				continue;
@@ -822,7 +946,7 @@ void Terrain3DStreamer::step() {
 	Vector<Want> cands;
 	for (const KeyValue<Vector2i, Want> &kv : wanted) {
 		const Vector2i &loc = kv.key;
-		if (resident.has(loc) || data->has_region(loc) || _is_failed(loc) || _pending.has(loc) ||
+		if (kv.value.lazy || resident.has(loc) || data->has_region(loc) || _is_failed(loc) || _pending.has(loc) ||
 				_staged_set.has(loc) || _saving.has(loc)) {
 			continue;
 		}
@@ -967,6 +1091,8 @@ Dictionary Terrain3DStreamer::get_stats() const {
 		gated += kv.value.held ? 1 : 0;
 		wait_max = MAX(wait_max, now - kv.value.since);
 	}
+	d["generating"] = (int)_lazy.size(); // Pending locations: registered, file not written yet
+	d["generating_wanted"] = _stat_generating_wanted; // Of those, wanted now and needed (not behind the direction of travel, not only fetched ahead of a path's reach)
 	d["gated"] = gated; // Loaded regions the insert gate holds back now
 	d["gate_timeouts"] = (int64_t)_stat_gate_timeouts; // Regions inserted anyway after gate_timeout_ms
 	d["gate_wait_ms_max"] = (int64_t)wait_max; // Longest time the gate held a region, waiting now or inserted since
@@ -1287,8 +1413,8 @@ real_t Terrain3DStreamer::get_path_ready_distance(const int p_id, const real_t p
 	_path_regions(*shape, regions);
 	real_t ready = total - from;
 	for (const KeyValue<Vector2i, Vector2> &kv : regions) {
-		if (kv.value.y < from || !_known_set.has(kv.key) || data->has_region(kv.key)) {
-			continue; // Behind, no file, or visible
+		if (kv.value.y < from || !(_known_set.has(kv.key) || _lazy.has(kv.key)) || data->has_region(kv.key)) {
+			continue; // Behind, no file (a pending location will have one), or visible
 		}
 		const uint64_t *until = _failed.getptr(kv.key);
 		if (until != nullptr && *until == UINT64_MAX) {
@@ -1314,7 +1440,9 @@ Dictionary Terrain3DStreamer::get_path_cost(const PackedVector3Array &p_points, 
 	_path_regions(shape, regions);
 	int known = 0;
 	int outside = 0;
+	int generating = 0;
 	for (const KeyValue<Vector2i, Vector2> &kv : regions) {
+		generating += _lazy.has(kv.key) ? 1 : 0;
 		if (_known_set.has(kv.key)) {
 			known++;
 			outside += (data != nullptr && data->get_region_map_index(kv.key) < 0) ? 1 : 0;
@@ -1329,6 +1457,7 @@ Dictionary Terrain3DStreamer::get_path_cost(const PackedVector3Array &p_points, 
 	d["region_bytes"] = region_bytes;
 	d["bytes"] = region_bytes * known;
 	d["outside_window"] = outside;
+	d["generating"] = generating; // Pending locations on the path, not in regions: no file yet
 	return d;
 }
 
@@ -1526,8 +1655,9 @@ void Terrain3DStreamer::_retire(const Vector2i &p_region_loc, const Ref<Terrain3
 	RetireJob *job = memnew(RetireJob);
 	job->region = p_region;
 	job->loc = p_region_loc;
-	if (_persist_edits && !p_dir.is_empty() && p_region->is_modified() && !p_region->is_read_only()) {
-		job->path = p_dir + String("/") + Util::location_to_filename(p_region_loc);
+	// A pending location's file belongs to the game's generator: never write a base file for it
+	if (_persist_edits && !p_dir.is_empty() && p_region->is_modified() && !p_region->is_read_only() && !_lazy.has(p_region_loc)) {
+		job->path = _file_path(p_region_loc, p_dir);
 		job->save_16_bit = _terrain->get_save_16_bit();
 		_saving.insert(p_region_loc);
 	}
@@ -1682,11 +1812,17 @@ void Terrain3DStreamer::_advance_staged(Terrain3DData *p_data, const uint64_t p_
 	}
 }
 
+// The file of a location: the path it was written with, else the data directory's own name for it
+String Terrain3DStreamer::_file_path(const Vector2i &p_loc, const String &p_dir) const {
+	const String *path = _paths.getptr(p_loc);
+	return path != nullptr ? *path : p_dir + String("/") + Util::location_to_filename(p_loc);
+}
+
 // Starts a threaded load for a location, asking the resolver (if set) which file to use.
 // Returns ERR_BUSY if the file is already loading for another location: a threaded load
 // can be consumed only once, so shared files load one location at a time.
 Error Terrain3DStreamer::_request_load(const Vector2i &p_loc, const String &p_dir) {
-	String path = p_dir + String("/") + Util::location_to_filename(p_loc);
+	String path = _file_path(p_loc, p_dir);
 	Resolved info;
 	bool has_info = false;
 	if (_resolver.is_valid()) {
@@ -1844,6 +1980,12 @@ void Terrain3DStreamer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_resolver"), &Terrain3DStreamer::get_resolver);
 	ClassDB::bind_method(D_METHOD("register_virtual_locations", "locations"), &Terrain3DStreamer::register_virtual_locations);
 	ClassDB::bind_method(D_METHOD("clear_virtual_locations"), &Terrain3DStreamer::clear_virtual_locations);
+	ClassDB::bind_method(D_METHOD("register_pending_locations", "locations"), &Terrain3DStreamer::register_pending_locations);
+	ClassDB::bind_method(D_METHOD("clear_pending_locations"), &Terrain3DStreamer::clear_pending_locations);
+	ClassDB::bind_method(D_METHOD("get_pending_locations"), &Terrain3DStreamer::get_pending_locations);
+	ClassDB::bind_method(D_METHOD("get_wanted_pending", "max"), &Terrain3DStreamer::get_wanted_pending, DEFVAL(64));
+	ClassDB::bind_method(D_METHOD("notify_region_written", "location", "path"), &Terrain3DStreamer::notify_region_written, DEFVAL(String()));
+	ClassDB::bind_method(D_METHOD("notify_regions_written", "locations"), &Terrain3DStreamer::notify_regions_written);
 	ClassDB::bind_method(D_METHOD("get_required_slots", "distance"), &Terrain3DStreamer::get_required_slots);
 	ClassDB::bind_method(D_METHOD("get_max_distance"), &Terrain3DStreamer::get_max_distance);
 	ClassDB::bind_method(D_METHOD("scan_directory"), &Terrain3DStreamer::scan_directory);
