@@ -691,8 +691,26 @@ void Terrain3DData::enable_streaming(const int p_slot_capacity) {
 	// A disabled color map allocates no color array at all
 	const bool color_enabled = _terrain->get_color_map_enabled();
 	Ref<Image> blank_col;
+	_pool_color_mode = COMPRESS_NONE;
+	_pool_blank_color.unref();
 	if (color_enabled) {
-		blank_col = Util::get_filled_image(V2I(rs), COLOR[TYPE_COLOR], true, FORMAT[TYPE_COLOR]);
+		// At runtime a compress mode makes the color pool compressed: regions then carry (and upload) a
+		// compressed color map of this format, the pool layers are a quarter of the size, and no
+		// uncompressed copy has to stay in RAM. The editor edits the uncompressed map, so it keeps the
+		// uncompressed pool. An engine that cannot compress (export template) falls back to uncompressed
+		const CompressMode mode = _terrain->get_color_compress_mode();
+		if (mode != COMPRESS_NONE && !IS_EDITOR) {
+			blank_col = Util::get_compressed_color_blank(V2I(rs), mode);
+			if (blank_col.is_valid()) {
+				_pool_color_mode = mode;
+				_pool_blank_color = blank_col;
+			} else {
+				LOG(WARN, "Color compression mode ", mode, " is unavailable in this engine build. The streaming color pool stays uncompressed");
+			}
+		}
+		if (blank_col.is_null()) {
+			blank_col = Util::get_filled_image(V2I(rs), COLOR[TYPE_COLOR], true, FORMAT[TYPE_COLOR]);
+		}
 	}
 	TypedArray<Image> hl, cl, coll;
 	for (int i = 0; i < _slot_capacity; i++) {
@@ -718,6 +736,17 @@ void Terrain3DData::enable_streaming(const int p_slot_capacity) {
 	emit_signal("control_maps_changed");
 	emit_signal("color_maps_changed");
 	emit_signal("maps_changed");
+}
+
+// True when the region carries a compressed color map the compressed streaming pool can take as it is:
+// same format, size and mipmap count as the pool's blank layers
+bool Terrain3DData::_has_pool_color(const Ref<Terrain3DRegion> &p_region) const {
+	if (_pool_blank_color.is_null() || p_region.is_null()) {
+		return false;
+	}
+	Ref<Image> c = p_region->get_compressed_color_map();
+	return c.is_valid() && !c->is_empty() && c->get_format() == _pool_blank_color->get_format() &&
+			c->get_size() == _pool_blank_color->get_size() && c->get_mipmap_count() == _pool_blank_color->get_mipmap_count();
 }
 
 Error Terrain3DData::add_region_streamed(const Ref<Terrain3DRegion> &p_region) {
@@ -755,9 +784,13 @@ Error Terrain3DData::reserve_region_streamed(const Ref<Terrain3DRegion> &p_regio
 	// A disabled color map is neither allocated, mipmapped nor uploaded; the region
 	// keeps whatever color data it has so a later save does not lose it
 	const bool color_enabled = _terrain != nullptr && _terrain->get_color_map_enabled();
-	// The pool's color layers are uncompressed. A region that carries only its compressed
+	// A compressed pool takes a compressed copy of its own format, which the region needs no uncompressed
+	// map next to; anything else is converted when it is uploaded
+	const bool pool_compressed = color_enabled && _pool_color_mode != COMPRESS_NONE;
+	const bool compressed_ready = pool_compressed && _has_pool_color(p_region);
+	// An uncompressed pool's color layers are uncompressed. A region that carries only its compressed
 	// color map (no uncompressed copy) is expanded rather than replaced with a blank
-	if (color_enabled && p_region->get_color_map().is_null() && p_region->is_color_compressed()) {
+	if (color_enabled && !pool_compressed && p_region->get_color_map().is_null() && p_region->is_color_compressed()) {
 		Ref<Image> expanded = p_region->get_compressed_color_map()->duplicate();
 		if (expanded->is_compressed()) {
 			expanded->decompress();
@@ -765,7 +798,7 @@ Error Terrain3DData::reserve_region_streamed(const Ref<Terrain3DRegion> &p_regio
 		expanded->convert(FORMAT[TYPE_COLOR]);
 		p_region->set_color_map(expanded);
 	}
-	p_region->sanitize_maps(color_enabled);
+	p_region->sanitize_maps(color_enabled && !compressed_ready);
 	p_region->set_deleted(false);
 	r_slot = _free_slots[_free_slots.size() - 1];
 	_free_slots.remove_at(_free_slots.size() - 1);
@@ -782,8 +815,29 @@ void Terrain3DData::upload_region_streamed(const Ref<Terrain3DRegion> &p_region,
 			_generated_control_maps.update(p_region->get_control_map(), p_slot);
 		} break;
 		case TYPE_COLOR: {
-			if (_terrain != nullptr && _terrain->get_color_map_enabled() && p_region->get_color_map().is_valid()) {
-				_generated_color_maps.update(p_region->get_color_map(), p_slot);
+			if (_terrain == nullptr || !_terrain->get_color_map_enabled()) {
+				break;
+			}
+			if (_pool_color_mode == COMPRESS_NONE) {
+				if (p_region->get_color_map().is_valid()) {
+					_generated_color_maps.update(p_region->get_color_map(), p_slot);
+				}
+				break;
+			}
+			// Compressed pool
+			Ref<Image> color;
+			if (_has_pool_color(p_region)) {
+				color = p_region->get_compressed_color_map();
+			} else {
+				// A region file without a matching compressed copy (written uncompressed, or with another
+				// mode): compress it here, once, rather than show a blank or a mismatched layer
+				LOG(WARN, "Region ", p_region->get_location(), " has no ", (int)_pool_color_mode, " compressed color map. Compressing it on the main thread");
+				p_region->compress_color_map(_pool_color_mode);
+				color = _has_pool_color(p_region) ? p_region->get_compressed_color_map() : _pool_blank_color;
+			}
+			_generated_color_maps.update(color, p_slot);
+			if (!_terrain->get_keep_uncompressed_color() && _has_pool_color(p_region)) {
+				p_region->clear_color_map();
 			}
 		} break;
 		default:
@@ -1797,6 +1851,7 @@ void Terrain3DData::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("enable_streaming", "slot_capacity"), &Terrain3DData::enable_streaming);
 	ClassDB::bind_method(D_METHOD("is_streaming"), &Terrain3DData::is_streaming);
 	ClassDB::bind_method(D_METHOD("get_slot_capacity"), &Terrain3DData::get_slot_capacity);
+	ClassDB::bind_method(D_METHOD("get_color_pool_compress_mode"), &Terrain3DData::get_color_pool_compress_mode);
 	ClassDB::bind_method(D_METHOD("get_free_slot_count"), &Terrain3DData::get_free_slot_count);
 	ClassDB::bind_method(D_METHOD("add_region_streamed", "region"), &Terrain3DData::add_region_streamed);
 	ClassDB::bind_method(D_METHOD("evict_region", "region_location", "save_directory"), &Terrain3DData::evict_region);

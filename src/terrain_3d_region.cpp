@@ -200,14 +200,20 @@ void Terrain3DRegion::compress_color_map(const CompressMode p_compress_mode) {
 		_compressed_color_map.unref();
 		return;
 	}
-	if (!IS_EDITOR) {
-		LOG(ERROR, "Cannot compress maps in export builds");
+	// Any build whose engine carries the compression libraries can compress (the editor, and game builds
+	// made from an editor binary); export templates cannot, and keep the uncompressed map
+	if (!Util::can_compress(p_compress_mode)) {
+		LOG(WARN, "This engine build cannot compress images with mode ", p_compress_mode, ". The color map stays uncompressed");
 		return;
 	}
 	if (p_compress_mode >= COMPRESS_S3TC && p_compress_mode <= COMPRESS_ASTC) {
 		LOG(INFO, "Compressing color map with mode: ", p_compress_mode);
-		_compressed_color_map = _color_map->duplicate();
-		_compressed_color_map->compress_from_channels(Image::CompressMode(p_compress_mode), Image::USED_CHANNELS_RGBA);
+		Ref<Image> compressed = _color_map->duplicate();
+		if (compressed->compress_from_channels(Image::CompressMode(p_compress_mode), Image::USED_CHANNELS_RGBA) != OK) {
+			LOG(ERROR, "Compressing the color map failed. It stays uncompressed");
+			return;
+		}
+		_compressed_color_map = compressed;
 		_modified = true;
 		_last_color_compression = p_compress_mode;
 	}
@@ -396,14 +402,22 @@ Error Terrain3DRegion::save(const String &p_path, const bool p_16_bit, const Com
 		// incuding those in the undo queue
 		take_over_path(p_path);
 	}
+	// A region that carries only its compressed color map (runtime streaming frees the
+	// uncompressed copy) saves it as it is, whatever mode was asked for: its colors cannot be
+	// regenerated, and dropping them would save a blank map
+	const bool compressed_only = (_color_map.is_null() || _color_map->is_empty()) && _compressed_color_map.is_valid();
+	const CompressMode color_mode = compressed_only ? _last_color_compression : p_color_compress_mode;
 	// Don't save if not modified, or current color compression mode is different from what was loaded
-	if (!_modified && _last_color_compression == p_color_compress_mode) {
+	if (!_modified && _last_color_compression == color_mode) {
 		LOG(INFO, "Region ", _location, " not modified. Skipping ", p_path);
 		return ERR_SKIP;
 	}
-	_compressed_color_map.unref();
-	if (IS_EDITOR) {
-		compress_color_map(p_color_compress_mode);
+	if (!compressed_only) {
+		_compressed_color_map.unref();
+		// Compresses wherever the engine can (editor, or a game run from an editor binary)
+		if (IS_EDITOR || color_mode != COMPRESS_NONE) {
+			compress_color_map(color_mode);
+		}
 	}
 	LOG(MESG, "Writing", (p_16_bit) ? " 16-bit" : "", " region ", _location, " to ", get_path());
 	set_version(Terrain3DData::CURRENT_DATA_VERSION);

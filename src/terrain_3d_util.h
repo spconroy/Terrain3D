@@ -38,6 +38,8 @@ public:
 
 	// Image operations
 	static CompressMode get_compress_mode(const Image::Format p_format);
+	static bool can_compress(const CompressMode p_mode);
+	static Ref<Image> get_compressed_color_blank(const Vector2i &p_size, const CompressMode p_mode);
 	static Ref<Image> black_to_alpha(const Ref<Image> &p_image);
 	static Vector2 get_min_max(const Ref<Image> &p_image);
 	static Ref<Image> get_thumbnail(const Ref<Image> &p_image, const Vector2i &p_size = V2I(256));

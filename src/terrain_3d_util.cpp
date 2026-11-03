@@ -4,6 +4,7 @@
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/classes/time.hpp>
+#include <mutex>
 
 #include "logger.h"
 #include "terrain_3d_util.h"
@@ -134,6 +135,39 @@ PackedStringArray Terrain3DUtil::get_files(const String &p_dir, const String &p_
 		files.push_back(fname);
 	}
 	return files;
+}
+
+// True when this engine build can compress RGBA8 images with the given mode. Editor builds can,
+// export templates don't carry the compression libraries. Probed once per mode with a 4x4 image
+// (ERR_FAIL inside Image::compress prints once), then cached.
+bool Terrain3DUtil::can_compress(const CompressMode p_mode) {
+	if (p_mode < COMPRESS_S3TC || p_mode > COMPRESS_ASTC) {
+		return false;
+	}
+	static int8_t cache[6] = { -1, -1, -1, -1, -1, -1 };
+	static std::mutex mutex;
+	std::lock_guard<std::mutex> lock(mutex);
+	if (cache[p_mode] < 0) {
+		Ref<Image> probe = Image::create_empty(8, 8, false, Image::FORMAT_RGBA8);
+		probe->fill(Color(0.5f, 0.5f, 0.5f, 0.5f));
+		cache[p_mode] = probe->compress_from_channels(Image::CompressMode(p_mode), Image::USED_CHANNELS_RGBA) == OK && probe->is_compressed();
+	}
+	return cache[p_mode] > 0;
+}
+
+// A neutral (COLOR_ROUGHNESS) mipmapped color map compressed with p_mode, for the streaming pool's
+// blank layers. Null when the engine cannot compress.
+Ref<Image> Terrain3DUtil::get_compressed_color_blank(const Vector2i &p_size, const CompressMode p_mode) {
+	if (!can_compress(p_mode)) {
+		return Ref<Image>();
+	}
+	Ref<Image> img = Image::create_empty(p_size.x, p_size.y, true, Image::FORMAT_RGBA8);
+	img->fill(COLOR_ROUGHNESS);
+	img->generate_mipmaps();
+	if (img->compress_from_channels(Image::CompressMode(p_mode), Image::USED_CHANNELS_RGBA) != OK) {
+		return Ref<Image>();
+	}
+	return img;
 }
 
 // Converts Image::Format to Image::CompressMode and our CompressMode
