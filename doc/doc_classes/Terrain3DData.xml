@@ -354,6 +354,12 @@
 				Returns [code skip-lint]Color(NAN, NAN, NAN, NAN)[/code] if the position is outside of defined regions.
 			</description>
 		</method>
+		<method name="get_color_pool_compress_mode" qualifiers="const">
+			<return type="int" enum="Terrain3D.CompressMode" />
+			<description>
+				Streaming only. The [enum Terrain3D.CompressMode] of the pooled color array: the Terrain3D color_compress_mode when the streaming pool was created compressed, [constant Terrain3D.COMPRESS_NONE] when it is uncompressed (compression off, the engine build cannot compress, or the editor).
+			</description>
+		</method>
 		<method name="get_slot_capacity" qualifiers="const">
 			<return type="int" />
 			<description>

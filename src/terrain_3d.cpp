@@ -729,6 +729,10 @@ void Terrain3D::set_color_compress_mode(const CompressMode p_color_compress_mode
 	for (Ref<Terrain3DRegion> region : regions) {
 		region->check_compressed_color_map(_color_compress_mode);
 	}
+	// The pooled color array has the format of the mode: rebuild the pool when it changes at runtime
+	if (_initialized && is_streaming_active() && !IS_EDITOR) {
+		_reinit_streaming_pool();
+	}
 }
 
 void Terrain3D::set_label_distance(const real_t p_distance) {

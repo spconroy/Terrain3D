@@ -83,6 +83,9 @@ private:
 	// Region streaming slot pool, see enable_streaming() in terrain_3d_data.cpp
 	bool _streaming = false;
 	int _slot_capacity = 0;
+	CompressMode _pool_color_mode = COMPRESS_NONE; // Format of the pooled color array. COMPRESS_NONE = uncompressed
+	Ref<Image> _pool_blank_color; // Neutral compressed layer: also the fallback for a region that cannot supply one
+	bool _has_pool_color(const Ref<Terrain3DRegion> &p_region) const;
 	Vector<int> _free_slots; // Free texture array layer indices
 	HashMap<Vector2i, int> _slot_of; // Region location -> slot
 	TypedArray<Vector2i> _slot_locs; // Slot -> location, the shader's per layer table
@@ -106,6 +109,7 @@ public:
 	void enable_streaming(const int p_slot_capacity);
 	bool is_streaming() const { return _streaming; }
 	int get_slot_capacity() const { return _slot_capacity; }
+	CompressMode get_color_pool_compress_mode() const { return _pool_color_mode; }
 	int get_free_slot_count() const { return _free_slots.size(); }
 	Error add_region_streamed(const Ref<Terrain3DRegion> &p_region);
 	// The same insertion in steps, so the streamer can spread it over frames
